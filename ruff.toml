@@ -1,0 +1,58 @@
+line-length = 120
+output-format = "grouped"
+target-version = "py310"
+
+src = ["scribe"]
+
+exclude = [
+    "robot_assets",
+    "docs",
+    ".visualizer_runtime",
+    ".hf_cache",
+]
+
+[lint]
+select = [
+    # isort
+    "I",
+    # bugbear
+    "B",
+    # unused imports
+    "F401",
+    # bare except
+    "E722",
+    # unused arguments
+    "ARG",
+    # print statements
+    "T201",
+    "T203",
+    # misuse of typing.TYPE_CHECKING
+    "TC004",
+    # import rules
+    "TID251",
+]
+ignore = [
+    # mutable defaults
+    "B006",
+    # allow print in CLI entry points
+    "T201",
+]
+unfixable = [
+    # don't auto-remove print statements
+    "T201",
+    "T203",
+]
+
+[format]
+docstring-code-format = true
+
+[lint.isort]
+known-first-party = ["scribe"]
+length-sort = true
+length-sort-straight = true
+combine-as-imports = true
+
+[lint.per-file-ignores]
+"scribe/export.py" = ["T201"]    # allow print in export CLI
+"scripts/**" = ["T201"]
+"scribe/annotation_store.py" = ["ARG001"]  # interface-required params

@@ -1,0 +1,62 @@
+[project]
+name = "scribe"
+version = "0.1.0"
+description = "LeRobot dataset visualizer & annotator"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.10.*"
+scipy = ">=1.14,<2"
+numpy = ">=2.2,<3"
+pandas = ">=2.3,<3"
+opencv = ">=4.12,<5"
+matplotlib = ">=3.10,<4"
+pillow = ">=11.0,<12"
+h5py = ">=3.14,<4"
+pyarrow = ">=21.0,<22"
+av = ">=15.0,<16"
+tqdm = ">=4.67,<5"
+click = ">=8.2,<9"
+pip = "*"
+rerun-sdk = "0.21.0.*"
+dill = "<0.3.9"
+casadi = "*"
+ruff = ">=0.11,<1"
+
+[pypi-dependencies]
+# lerobot
+lerobot = "==0.3.3"
+# 数据处理依赖
+datasets = "*"
+huggingface-hub = "*"
+# CLI工具
+tyro = ">=0.9.28,<1"
+termcolor = "*"
+# 文件格式支持
+openpyxl = ">=3.1.5,<4"
+# 图像处理
+imageio = ">=2.37.0,<3"
+imageio-ffmpeg = ">=0.6.0,<1"
+opencv-python = ">=4.12.0,<5"
+opencv-python-headless = ">=4.12.0,<5"
+
+# ── Tasks ──────────────────────────────────────────────────────────
+[tasks]
+# -- 开发相关 --
+# 启动可视化服务器：DATASET_ROOT=/path/to/dataset pixi run serve
+serve = "bash scripts/run.sh"
+# 下载前端 vendor 依赖（首次使用或 vendor 丢失时执行）
+vendor = "bash scripts/download_vendor.sh"
+# 导出标注：DATASET_ROOT=/path/to/dataset pixi run export
+export = { cmd = "python -m scribe.export --dataset-root ${DATASET_ROOT} --scheme sparse --overwrite", env = { DATASET_ROOT = "/path/to/your/dataset" } }
+
+# -- 代码检查 --
+lint = "ruff check scribe/"
+lint-fix = "ruff check scribe/ --fix"
+format = "ruff format scribe/"
+format-check = "ruff format --check scribe/"
+syntax = "python -m py_compile scribe/app.py && python -m py_compile scribe/routes.py && python -m py_compile scribe/data.py && python -m py_compile scribe/annotation_store.py && python -m py_compile scribe/export.py && echo 'Syntax OK'"
+# 一键全量检查：lint + format-check + syntax
+check = { depends-on = ["lint", "format-check", "syntax"] }
+

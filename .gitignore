@@ -1,0 +1,24 @@
+# Runtime/cache directories (machine-local)
+.hf_cache/
+.visualizer_runtime/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store
+
+# docs
+docs/
+
+# pixi
+.pixi/
+

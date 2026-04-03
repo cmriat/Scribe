@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<robot name="sbs1_dual_arm_no_camera" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- SBS1 Dual-Arm Platform (ALOHA-style) - Without Camera
+       Two Airbot Play G2 arms mounted on a simple base
+       Layout: left_arm | base_frame | right_arm
+       Origin: Center of the base (between two arms) -->
+
+  <!-- Configuration Parameters -->
+
+  <!-- Base plate dimensions (meters) -->
+  <xacro:property name="base_length" value="0.18"/>   <!-- X direction -->
+  <xacro:property name="base_width" value="0.8"/>    <!-- Y direction (arm separation) -->
+  <xacro:property name="base_height" value="0.03"/>  <!-- Z direction (thickness) -->
+
+  <!-- Arm separation: distance from center to each arm base_link -->
+  <xacro:property name="arm_y_offset" value="0.30"/>  <!-- Half of total arm spacing -->
+
+  <!-- Arm mounting height above base plate -->
+  <xacro:property name="arm_z_offset" value="0"/>
+
+  <!-- Include arm macro (without camera) -->
+  <xacro:include filename="$(find sbs1_description)/urdf/arms/play_g2.xacro"/>
+
+  <!-- World and Base Links -->
+
+  <!-- World Link (fixed reference frame) -->
+  <link name="world"/>
+
+  <!-- Base Link - Simple box as the platform base -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="5.0"/>
+      <inertia ixx="0.1" ixy="0.0" ixz="0.0"
+               iyy="0.15" iyz="0.0"
+               izz="0.2"/>
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 ${-base_height/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+      <material name="base_material">
+        <color rgba="1.0 1.0 1.0 1.0"/>  <!-- White -->
+      </material>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 ${-base_height/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Fixed joint from world to base_link -->
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <!-- Base is elevated so arms can reach downward -->
+    <origin xyz="0 0 0.03" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Left Arm (without camera) -->
+  <xacro:play_g2_arm prefix="left_" parent="base_link">
+    <origin xyz="0 ${arm_y_offset} ${arm_z_offset}" rpy="0 0 0"/>
+  </xacro:play_g2_arm>
+
+  <!-- Right Arm (without camera) -->
+  <xacro:play_g2_arm prefix="right_" parent="base_link">
+    <origin xyz="0 ${-arm_y_offset} ${arm_z_offset}" rpy="0 0 0"/>
+  </xacro:play_g2_arm>
+
+</robot>
