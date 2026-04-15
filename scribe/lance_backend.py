@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import bisect
 import logging
+import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +42,23 @@ except ImportError as err:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+
+def _find_bin(name: str) -> str:
+    """Locate an executable, preferring the active Python env's bin dir."""
+    env_bin = Path(sys.executable).parent / name
+    if env_bin.exists():
+        return str(env_bin)
+    found = shutil.which(name)
+    if found:
+        return found
+    raise FileNotFoundError(
+        f"{name!r} not found in {env_bin} or PATH. Install ffmpeg into the pixi env."
+    )
+
+
+FFMPEG_BIN = _find_bin("ffmpeg")
+FFPROBE_BIN = _find_bin("ffprobe")
 
 LANCE_SUFFIX = ".lance"
 CAMERA_KEYS_DEFAULT = ("mid", "left", "right")
@@ -151,36 +170,55 @@ class _EpisodeLance:
         return master, slave
 
     @property
-    def dataframe(self) -> pd.DataFrame:
-        if self._df is None:
-            cols = [f.name for f in self._ds.schema if "blob" not in str(f.type).lower()]
-            self._df = self._ds.to_table(columns=cols).to_pandas()
-        return self._df
+    def non_blob_columns(self) -> list[str]:
+        return [f.name for f in self._ds.schema if "blob" not in str(f.type).lower()]
+
+    def read_columns(self, columns: list[str], offset: int, length: int) -> pd.DataFrame:
+        """Read a row range for the given non-blob columns. Cached per (offset, length, cols).
+
+        lance 'fullzip' encoding reads full rows, but projecting to a few scalar
+        columns still avoids materializing the blob bytes themselves.
+        """
+        key = (offset, length, tuple(columns))
+        if not hasattr(self, "_slice_cache"):
+            self._slice_cache: dict = {}
+        if key in self._slice_cache:
+            return self._slice_cache[key]
+        tbl = self._ds.to_table(columns=list(columns), limit=length, offset=offset)
+        df = tbl.to_pandas()
+        self._slice_cache[key] = df
+        # tiny LRU to avoid unbounded growth
+        if len(self._slice_cache) > 8:
+            self._slice_cache.pop(next(iter(self._slice_cache)))
+        return df
+
+    def _first_last(self, column: str):
+        """Fetch column value at row 0 and row (row_count-1). Cheap vs full scan
+        because lance 'fullzip' reads whole rows — we only touch 2 rows."""
+        if self._row_count == 0:
+            return None, None
+        first = self._ds.to_table(columns=[column], limit=1).column(column)[0].as_py()
+        last = self._ds.to_table(columns=[column], limit=1, offset=self._row_count - 1).column(column)[0].as_py()
+        return first, last
 
     def robot_fps(self) -> float:
-        tbl = self._ds.to_table(columns=["timestamp"])
-        ts = tbl.column("timestamp").to_pandas()
-        if len(ts) < 2:
+        first, last = self._first_last("timestamp")
+        if first is None or last is None or self._row_count < 2:
             return 100.0
-        dur = (ts.iloc[-1] - ts.iloc[0]).total_seconds()
-        return (len(ts) - 1) / dur if dur > 0 else 100.0
+        dur = (last - first).total_seconds()
+        return (self._row_count - 1) / dur if dur > 0 else 100.0
 
     def camera_fps(self, cam: str) -> float:
         if cam in self._cam_fps:
             return self._cam_fps[cam]
-        tbl = self._ds.to_table(columns=[f"{cam}_frame_id", f"{cam}_timestamp_ns"])
-        fid = tbl.column(f"{cam}_frame_id").to_numpy()
-        ts = tbl.column(f"{cam}_timestamp_ns").to_pandas()
-        if len(fid) == 0:
+        first_fid, last_fid = self._first_last(f"{cam}_frame_id")
+        first_ts, last_ts = self._first_last(f"{cam}_timestamp_ns")
+        if first_fid is None or last_fid is None or last_fid <= first_fid:
             self._cam_fps[cam] = 30.0
             return 30.0
-        mask = np.concatenate(([True], fid[1:] != fid[:-1]))
-        unique_ts = ts[mask].sort_values().reset_index(drop=True)
-        if len(unique_ts) < 2:
-            self._cam_fps[cam] = 30.0
-        else:
-            dur = (unique_ts.iloc[-1] - unique_ts.iloc[0]).total_seconds()
-            self._cam_fps[cam] = (len(unique_ts) - 1) / dur if dur > 0 else 30.0
+        dur = (last_ts - first_ts).total_seconds()
+        unique_frames = int(last_fid) - int(first_fid) + 1
+        self._cam_fps[cam] = (unique_frames - 1) / dur if dur > 0 else 30.0
         return self._cam_fps[cam]
 
     def camera_resolution(self, cam: str) -> tuple[int, int]:
@@ -224,7 +262,7 @@ def _probe_h264_wh(h264_bytes: bytes) -> tuple[int, int] | None:
     try:
         r = subprocess.run(
             [
-                "ffprobe", "-v", "error", "-f", "h264",
+                FFPROBE_BIN, "-v", "error", "-f", "h264",
                 "-select_streams", "v:0", "-show_entries", "stream=width,height",
                 "-of", "csv=p=0", "-",
             ],
@@ -423,18 +461,39 @@ class LanceDataset:
             )
         local_from = g_from - ep_start
         local_to = g_to - ep_start
-        df = ep.dataframe
-        sub = df.iloc[local_from:local_to]
-        n = len(sub)
+        n = local_to - local_from
 
-        out: dict[str, np.ndarray] = {}
+        # Collect lance columns we actually need (+ always timestamp for derived).
+        need_srcs: set[str] = set()
+        derived_needs_ts = False
         for col in cols:
             if col not in self._features:
                 raise KeyError(f"LanceDataset: feature not declared: {col}")
             kind, src = FEATURE_SOURCE[col]
             if kind == "lance_col":
+                need_srcs.add(src)
+            elif src == "timestamp":
+                derived_needs_ts = True
+        if derived_needs_ts:
+            need_srcs.add("timestamp")
+
+        available = set(ep.non_blob_columns)
+        fetch_cols = [c for c in need_srcs if c in available]
+        sub = ep.read_columns(fetch_cols, offset=local_from, length=n) if fetch_cols else pd.DataFrame()
+
+        # First-row timestamp (episode-relative 0). Read once per episode, cached.
+        ep_first_ts_ns: int | None = None
+        if derived_needs_ts:
+            if not hasattr(ep, "_first_ts_ns") or ep._first_ts_ns is None:
+                first = ep._first_last("timestamp")[0]
+                ep._first_ts_ns = int(first.value) if hasattr(first, "value") else int(first)
+            ep_first_ts_ns = ep._first_ts_ns
+
+        out: dict[str, np.ndarray] = {}
+        for col in cols:
+            kind, src = FEATURE_SOURCE[col]
+            if kind == "lance_col":
                 if src not in sub.columns:
-                    # missing velocity/effort: zero-fill to keep callers happy
                     dim = self._features[col]["shape"][0]
                     out[col] = np.zeros((n, dim), dtype=np.float32)
                     continue
@@ -444,11 +503,10 @@ class LanceDataset:
                 else:
                     arr = series.to_numpy(dtype=np.float32).reshape(n, -1)
                 out[col] = arr
-            else:  # derived
+            else:
                 if src == "timestamp":
                     ts = sub["timestamp"].astype("int64").to_numpy()
-                    ep_first_ts = int(df["timestamp"].iloc[0].value) if hasattr(df["timestamp"].iloc[0], "value") else int(df["timestamp"].iloc[0])
-                    out[col] = ((ts - ep_first_ts).astype(np.float64) / 1e9).astype(np.float32)
+                    out[col] = ((ts - ep_first_ts_ns).astype(np.float64) / 1e9).astype(np.float32)
                 elif src == "frame_index":
                     out[col] = np.arange(local_from, local_to, dtype=np.int64)
                 elif src == "episode_index":
@@ -457,8 +515,6 @@ class LanceDataset:
                     out[col] = np.arange(g_from, g_to, dtype=np.int64)
                 elif src == "task_index":
                     out[col] = np.zeros(n, dtype=np.int64)
-                else:  # pragma: no cover
-                    raise RuntimeError(f"Unknown derived source: {src}")
         return out
 
     # ---- Video materialization ------------------------------------------------
@@ -491,7 +547,7 @@ class LanceDataset:
             try:
                 r = subprocess.run(
                     [
-                        "ffmpeg", "-y", "-loglevel", "error",
+                        FFMPEG_BIN, "-y", "-loglevel", "error",
                         "-f", "h264", "-framerate", f"{fps:.6f}",
                         "-i", "-",
                         "-c", "copy", "-movflags", "+faststart",
