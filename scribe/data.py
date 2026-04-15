@@ -16,6 +16,13 @@ import requests
 from lerobot.datasets.utils import IterableNamespace
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+from scribe.lance_backend import LanceDataset
+
+# Anywhere the code used to do `isinstance(x, LeRobotDataset)` to mean
+# "local dataset with .root / .hf_dataset / .episode_data_index / .meta"
+# we now accept LanceDataset too.
+LOCAL_DATASET_TYPES = (LeRobotDataset, LanceDataset)
+
 # ---------------------------------------------------------------------------
 # Video display order
 # ---------------------------------------------------------------------------
@@ -73,7 +80,7 @@ _episode_timestamp_cache_lock = Lock()
 
 def _get_dataset_cache_key(dataset: LeRobotDataset | IterableNamespace) -> str:
     repo_id = getattr(dataset, "repo_id", "")
-    if isinstance(dataset, LeRobotDataset):
+    if isinstance(dataset, LOCAL_DATASET_TYPES):
         root = str(dataset.root.resolve())
         return f"local:{root}:{repo_id}"
     return f"hub:{repo_id}"
@@ -180,7 +187,7 @@ def get_episode_data(dataset: LeRobotDataset | IterableNamespace, episode_index)
     for column_name in selected_columns:
         dim_state = (
             dataset.meta.shapes[column_name][0]
-            if isinstance(dataset, LeRobotDataset)
+            if isinstance(dataset, LOCAL_DATASET_TYPES)
             else dataset.features[column_name].shape[0]
         )
 
@@ -208,7 +215,7 @@ def get_episode_data(dataset: LeRobotDataset | IterableNamespace, episode_index)
 
     requested_columns = ["timestamp", *selected_columns]
 
-    if isinstance(dataset, LeRobotDataset):
+    if isinstance(dataset, LOCAL_DATASET_TYPES):
         from_idx = dataset.episode_data_index["from"][episode_index]
         to_idx = dataset.episode_data_index["to"][episode_index]
         data = (
@@ -245,7 +252,7 @@ def get_episode_timestamps(dataset: LeRobotDataset | IterableNamespace, episode_
     if cached is not None:
         return cached
 
-    if isinstance(dataset, LeRobotDataset):
+    if isinstance(dataset, LOCAL_DATASET_TYPES):
         from_idx = dataset.episode_data_index["from"][episode_index]
         to_idx = dataset.episode_data_index["to"][episode_index]
         data = (dataset.hf_dataset.select(range(from_idx, to_idx)).select_columns(["timestamp"]).with_format("numpy"))[
@@ -266,7 +273,7 @@ def get_episode_timestamps(dataset: LeRobotDataset | IterableNamespace, episode_
 
 
 def get_episode_frame_count(dataset: LeRobotDataset | IterableNamespace, episode_index: int) -> int:
-    if isinstance(dataset, LeRobotDataset):
+    if isinstance(dataset, LOCAL_DATASET_TYPES):
         episode_meta = dataset.meta.episodes[episode_index]
         length = episode_meta.get("length")
         if isinstance(length, int):

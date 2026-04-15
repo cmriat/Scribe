@@ -22,3 +22,6 @@ docs/
 # pixi
 .pixi/
 
+tmp_data/
+airbot_lerobot/
+episode_*

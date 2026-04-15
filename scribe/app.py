@@ -13,6 +13,7 @@ from pathlib import Path
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from scribe.data import get_dataset_info
+from scribe.lance_backend import LanceDataset, is_lance_root
 from scribe.routes import run_server
 
 # ---------------------------------------------------------------------------
@@ -279,7 +280,7 @@ def _parse_bool_flag(value, flag_name: str) -> bool:
 
 
 def visualize_dataset_html(
-    dataset: LeRobotDataset | None,
+    dataset: LeRobotDataset | LanceDataset | None,
     episodes: list[int] | None = None,
     output_dir: Path | None = None,
     serve: bool = True,
@@ -430,6 +431,9 @@ def main():
     if repo_id:
         if "/" not in repo_id:
             root_name = root.name if root is not None else repo_id
+            # Strip .lance suffix so repo-id stays clean for URLs.
+            if root_name.endswith(".lance"):
+                root_name = root_name[: -len(".lance")]
             normalized_repo_id = f"local/{root_name}"
             logging.info(
                 "repo-id '%s' does not include namespace/name, normalized to '%s'",
@@ -438,11 +442,22 @@ def main():
             )
             repo_id = normalized_repo_id
 
-        dataset = (
-            LeRobotDataset(repo_id, root=root, tolerance_s=tolerance_s)
-            if not load_from_hf_hub
-            else get_dataset_info(repo_id)
-        )
+        if not load_from_hf_hub and is_lance_root(root):
+            # Ensure output_dir is resolved before building LanceDataset so the
+            # runtime MP4s persist across restarts in a stable location.
+            output_dir_arg = kwargs.get("output_dir")
+            if output_dir_arg is None:
+                output_dir_arg = tempfile.mkdtemp(prefix="scribe_lance_")
+                kwargs["output_dir"] = Path(output_dir_arg)
+            runtime_dir = Path(output_dir_arg) / "lance_runtime"
+            logging.info("detected lance root at %s; using runtime dir %s", root, runtime_dir)
+            dataset = LanceDataset(repo_id=repo_id, root=root, runtime_dir=runtime_dir)
+        else:
+            dataset = (
+                LeRobotDataset(repo_id, root=root, tolerance_s=tolerance_s)
+                if not load_from_hf_hub
+                else get_dataset_info(repo_id)
+            )
 
     visualize_dataset_html(dataset, **kwargs)
 

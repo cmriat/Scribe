@@ -85,10 +85,15 @@ def _slugify_text(value: str) -> str:
 
 
 def build_local_annotation_context(
-    dataset_obj: LeRobotDataset | IterableNamespace,
+    dataset_obj,
     repo_id: str,
 ) -> dict[str, Any]:
-    if isinstance(dataset_obj, LeRobotDataset):
+    # Both LeRobotDataset and LanceDataset expose a `.root` Path whose parent
+    # houses the annotations/ sidecar directory. Hub (IterableNamespace) has no
+    # root and annotations stay disabled.
+    from scribe.lance_backend import LanceDataset  # local import avoids cycles
+
+    if isinstance(dataset_obj, (LeRobotDataset, LanceDataset)):
         dataset_root = dataset_obj.root.resolve()
         annotations_dir = dataset_root / ANNOTATIONS_DIRNAME
         return {

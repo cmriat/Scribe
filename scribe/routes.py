@@ -18,6 +18,7 @@ from lerobot.datasets.utils import IterableNamespace
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from scribe.data import (
+    LOCAL_DATASET_TYPES,
     split_repo_id,
     get_dataset_info,
     get_episode_data,
@@ -176,7 +177,7 @@ def _resolve_dataset_or_error(repo_id: str, dataset_obj):
 
     dataset_version = (
         str(resolved_dataset.meta._version)
-        if isinstance(resolved_dataset, LeRobotDataset)
+        if isinstance(resolved_dataset, LOCAL_DATASET_TYPES)
         else resolved_dataset.codebase_version
     )
     match = re.search(r"v(\d+)\.", dataset_version)
@@ -227,8 +228,9 @@ def run_server(
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
     dataset_video_root = None
-    if isinstance(dataset, LeRobotDataset):
-        candidate = dataset.root / "videos"
+    if isinstance(dataset, LOCAL_DATASET_TYPES):
+        # LanceDataset carries its own video_root (runtime MP4 materialization).
+        candidate = getattr(dataset, "video_root", None) or (dataset.root / "videos")
         if candidate.exists():
             dataset_video_root = candidate.resolve()
 
@@ -300,15 +302,15 @@ def run_server(
         dataset_info = {
             "repo_id": repo_id,
             "num_samples": dataset_obj.num_frames
-            if isinstance(dataset_obj, LeRobotDataset)
+            if isinstance(dataset_obj, LOCAL_DATASET_TYPES)
             else dataset_obj.total_frames,
             "num_episodes": dataset_obj.num_episodes
-            if isinstance(dataset_obj, LeRobotDataset)
+            if isinstance(dataset_obj, LOCAL_DATASET_TYPES)
             else dataset_obj.total_episodes,
             "fps": dataset_obj.fps,
         }
 
-        if isinstance(dataset_obj, LeRobotDataset):
+        if isinstance(dataset_obj, LOCAL_DATASET_TYPES):
             video_paths = [dataset_obj.meta.get_video_file_path(episode_id, key) for key in dataset_obj.meta.video_keys]
             videos_info = []
             for video_path in video_paths:
@@ -364,7 +366,7 @@ def run_server(
         if episodes_value is None:
             episodes_value = list(
                 range(
-                    dataset_obj.num_episodes if isinstance(dataset_obj, LeRobotDataset) else dataset_obj.total_episodes
+                    dataset_obj.num_episodes if isinstance(dataset_obj, LOCAL_DATASET_TYPES) else dataset_obj.total_episodes
                 )
             )
 
