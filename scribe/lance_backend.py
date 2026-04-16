@@ -11,14 +11,15 @@ Design:
   unique GOPs for an episode+cam and remux to MP4 via ffmpeg (no re-encode),
   landing under `runtime_dir/videos/chunk-NNN/<cam>/episode_NNNNNN.mp4`. The
   existing Flask `/local_videos/<rel>` route serves them.
-- `dataset.fps` equals the detected robot sampling rate. Video players seek by
-  time (`frame_index / fps`); the MP4 has its own native fps and aligns in the
-  time domain.
+- `dataset.fps` equals the detected robot sampling rate for dygraph / robot
+  state. Video playback can additionally use per-camera `*_frame_id` arrays to
+  seek the remuxed MP4 by the exact Lance-selected frame instead of robot time.
 """
 
 from __future__ import annotations
 
 import bisect
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -62,6 +63,15 @@ FFPROBE_BIN = _find_bin("ffprobe")
 
 LANCE_SUFFIX = ".lance"
 CAMERA_KEYS_DEFAULT = ("mid", "left", "right")
+
+
+def _dataset_runtime_namespace(root: Path, repo_id: str) -> str:
+    """Build a stable, filesystem-safe runtime namespace for one lance dataset."""
+    root = Path(root).resolve()
+    stem = root.stem if root.suffix == LANCE_SUFFIX else root.name
+    slug = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem).strip("_") or "dataset"
+    digest = hashlib.sha1(f"{root}|{repo_id}".encode("utf-8")).hexdigest()[:12]
+    return f"{slug}_{digest}"
 
 # Feature name → how to fetch from a lance row batch.
 # "lance_col": direct column copy (possibly list→2D stack).
@@ -360,7 +370,7 @@ class LanceDataset:
         self.repo_id = str(repo_id)
         self._root = Path(root).resolve()
         self._runtime_dir = Path(runtime_dir).resolve()
-        self._video_root = self._runtime_dir / "videos"
+        self._video_root = self._runtime_dir / "videos" / _dataset_runtime_namespace(self._root, self.repo_id)
         self._video_root.mkdir(parents=True, exist_ok=True)
         self._remux_lock = threading.Lock()
 
@@ -443,6 +453,26 @@ class LanceDataset:
     @property
     def hf_dataset(self) -> _LanceHFShim:
         return _LanceHFShim(self)
+
+    def get_episode_video_seek_info(self, episode_index: int) -> dict[str, dict[str, object]]:
+        """Return per-camera frame-id arrays and fps for precise browser seeks."""
+        ep_idx = int(episode_index)
+        ep = self._episodes[ep_idx]
+        columns = [f"{cam}_frame_id" for cam in ep.cameras]
+        if not columns:
+            return {}
+        frame_df = ep.read_columns(columns, offset=0, length=ep.row_count)
+        out: dict[str, dict[str, object]] = {}
+        for cam in ep.cameras:
+            col = f"{cam}_frame_id"
+            if col not in frame_df.columns:
+                continue
+            frame_ids = np.asarray(frame_df[col], dtype=np.int64).reshape(-1)
+            out[f"observation.images.{cam}"] = {
+                "fps": float(ep.camera_fps(cam)),
+                "frame_ids": frame_ids.tolist(),
+            }
+        return out
 
     # ---- Row reading ----------------------------------------------------------
 

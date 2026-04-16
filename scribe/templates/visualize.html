@@ -397,6 +397,7 @@
                  class="w-full max-w-[460px] rounded-xl border border-zinc-700 bg-zinc-900 shadow-md overflow-hidden">
                 <p data-video-filename class="text-sm font-mono text-zinc-200 bg-zinc-800 px-3 py-2 truncate border-b border-zinc-700">{{ video_info.filename }}</p>
                 <video muted loop type="video/mp4" class="object-contain w-full aspect-video bg-black" @canplaythrough="videoCanPlay($event.target)" @timeupdate="handleVideoTimeUpdate($event.target)" @ended="() => {
+                    playbackActive = false;
                     $refs.btnPlay.classList.remove('hidden');
                     $refs.btnPause.classList.add('hidden');
                 }"
@@ -754,20 +755,23 @@
                     video.playbackRate = speed;
                     video.play();
                 });
+                playbackActive = true;
+                pendingSeekFrameIndex = null;
                 $refs.btnPlay.classList.toggle('hidden');
                 $refs.btnPause.classList.toggle('hidden');
             }">🔽</button>
             <button x-ref="btnPause" class="hidden px-2 rounded hover:bg-zinc-800" title="Pause. Toggle with Space" @click="() => {
                 videos.forEach(video => video.pause());
+                playbackActive = false;
                 $refs.btnPlay.classList.toggle('hidden');
                 $refs.btnPause.classList.toggle('hidden');
             }">⏸️</button>
             <button class="px-2 rounded hover:bg-zinc-800" title="Jump backward 5 seconds"
-                @click="() => (videos.forEach(video => (video.currentTime -= 5)))">⏪</button>
+                @click="seekByPrimaryVideoDelta(-5)">⏪</button>
             <button class="px-2 rounded hover:bg-zinc-800" title="Jump forward 5 seconds"
-                @click="() => (videos.forEach(video => (video.currentTime += 5)))">⏩</button>
+                @click="seekByPrimaryVideoDelta(5)">⏩</button>
             <button class="px-2 rounded hover:bg-zinc-800" title="Rewind from start"
-                @click="() => (videos.forEach(video => (video.currentTime = 0.0)))">↩️</button>
+                @click="seekToFrame(0)">↩️</button>
             <div class="flex items-center mx-2 text-sm">
                 <input type="number"
                     x-ref="playbackSpeed"
@@ -789,15 +793,10 @@
                 <span class="text-sm ml-1">x</span>
             </div>
             <input x-ref="slider" max="100" min="0" step="1" type="range" value="0" class="mx-2 min-w-[180px] flex-1 max-w-[520px]" @input="() => {
-                const sliderValue = $refs.slider.value;
-                videos.forEach(video => {
-                    const time = (video.duration * sliderValue) / 100;
-                    video.currentTime = time;
-                });
-                if (video?.duration) {
-                    const time = (video.duration * sliderValue) / 100;
-                    syncRobotPose(time);
-                }
+                const sliderValue = Number($refs.slider.value || 0);
+                const total = Math.max(1, currentEpisodeFrameCount - 1);
+                const frameIndex = Math.round((sliderValue / 100) * total);
+                seekToFrame(frameIndex);
             }" />
             <div x-ref="timer" class="font-mono text-sm border border-zinc-500 rounded-lg px-1 py-0.5 shrink-0">0:00 /
                 0:00
@@ -1269,6 +1268,7 @@
                 dygraphReady: false,
                 robotSceneReady: false,
                 autoPlayStarted: false,
+                playbackActive: false,
                 isEpisodeLoading: false,
                 videoCodecError: false,
                 isVideosDropdownOpen: false,
@@ -1282,6 +1282,7 @@
                 videosKeys: [],
                 videosKeysSelected: [],
                 videosInfo: [],
+                videoSeekInfo: {},
                 languageInstruction: '',
                 columns: [],
                 ignoredColumns: [],
@@ -1310,6 +1311,8 @@
                 annotationDraftError: '',
                 currentEpisodeFrameCount: Number((window.__INITIAL_EPISODE_PAYLOAD__ || {}).frame_count || 0),
                 episodeTimestamps: [],
+                suppressVideoTimeUpdate: false,
+                pendingSeekFrameIndex: null,
                 annotationDraft: {
                     segment_id: null,
                     selectedStage: '',
@@ -1637,6 +1640,9 @@
                 },
 
                 get currentFrameIndex() {
+                    if (Number.isFinite(this.dygraphIndex)) {
+                        return Math.max(0, Math.min(Math.max(0, this.currentEpisodeFrameCount - 1), Number(this.dygraphIndex)));
+                    }
                     return this.timeToFrameIndex(this.dygraphTime);
                 },
 
@@ -1776,17 +1782,7 @@
                 },
 
                 seekToFrame(frameIndex) {
-                    const time = this.frameIndexToTime(frameIndex);
-                    (this.videos || []).forEach((video) => {
-                        video.currentTime = time;
-                    });
-                    this.dygraphTime = time;
-                    this.dygraphIndex = this.timeToFrameIndex(time);
-                    if (this.dygraph) {
-                        this.dygraph.setSelection(this.dygraphIndex, undefined, true, true);
-                    }
-                    this.updateTableValues(time);
-                    this.syncRobotPose(time);
+                    this.applyFrameSelection(frameIndex, { syncVideos: true, updateUrl: true });
                 },
 
                 ensureAnnotationDraftDefaults() {
@@ -2107,6 +2103,8 @@
                 },
 
                 resetPlaybackUi() {
+                    this.playbackActive = false;
+                    this.pendingSeekFrameIndex = null;
                     if (this.$refs.btnPlay && this.$refs.btnPause) {
                         this.$refs.btnPlay.classList.remove('hidden');
                         this.$refs.btnPause.classList.add('hidden');
@@ -2127,6 +2125,9 @@
                     this.columns = Array.isArray(payload?.columns) ? payload.columns : [];
                     this.ignoredColumns = Array.isArray(payload?.ignored_columns) ? payload.ignored_columns : [];
                     this.videosInfo = Array.isArray(payload?.videos_info) ? payload.videos_info : [];
+                    this.videoSeekInfo = payload?.video_seek_info && typeof payload.video_seek_info === 'object'
+                        ? payload.video_seek_info
+                        : {};
                     this.languageInstruction = payload?.language_instruction || this.videosInfo?.[0]?.language_instruction || '';
                     if (payload?.curation_context) {
                         this.curationContext = payload.curation_context;
@@ -2172,11 +2173,161 @@
                         const videoElement = card.querySelector('video');
                         const sourceElement = videoElement?.querySelector('source');
                         if (videoElement && sourceElement) {
+                            const videoKey = String(videoInfo.filename || '');
+                            card.dataset.videoKey = videoKey;
+                            videoElement.dataset.videoKey = videoKey;
                             sourceElement.src = videoInfo.url || '';
                             videoElement.load();
                         }
                     });
                     return true;
+                },
+
+                videoKeyForElement(videoElement) {
+                    return String(videoElement?.dataset?.videoKey || '');
+                },
+
+                getVideoSeekEntry(videoKey) {
+                    if (!videoKey || !this.videoSeekInfo || typeof this.videoSeekInfo !== 'object') {
+                        return null;
+                    }
+                    const entry = this.videoSeekInfo[videoKey];
+                    if (!entry || !Array.isArray(entry.frame_ids)) {
+                        return null;
+                    }
+                    const fps = Number(entry.fps);
+                    if (!Number.isFinite(fps) || fps <= 0) {
+                        return null;
+                    }
+                    return entry;
+                },
+
+                nearestSortedIndex(values, target) {
+                    if (!Array.isArray(values) || values.length === 0) {
+                        return 0;
+                    }
+                    const targetValue = Number(target);
+                    if (!Number.isFinite(targetValue)) {
+                        return 0;
+                    }
+                    let left = 0;
+                    let right = values.length;
+                    while (left < right) {
+                        const middle = Math.floor((left + right) / 2);
+                        if (Number(values[middle]) < targetValue) {
+                            left = middle + 1;
+                        } else {
+                            right = middle;
+                        }
+                    }
+                    if (left <= 0) {
+                        return 0;
+                    }
+                    if (left >= values.length) {
+                        return values.length - 1;
+                    }
+                    const before = Number(values[left - 1]);
+                    const after = Number(values[left]);
+                    return Math.abs(after - targetValue) < Math.abs(before - targetValue) ? left : (left - 1);
+                },
+
+                frameIndexToVideoTime(frameIndex, videoKey, duration = null) {
+                    const entry = this.getVideoSeekEntry(videoKey);
+                    if (!entry) {
+                        const fallback = this.frameIndexToTime(frameIndex);
+                        if (Number.isFinite(duration) && duration >= 0) {
+                            return Math.max(0, Math.min(duration, fallback));
+                        }
+                        return fallback;
+                    }
+                    const ids = entry.frame_ids;
+                    if (ids.length === 0) {
+                        return 0;
+                    }
+                    const clamped = Math.max(0, Math.min(ids.length - 1, Number(frameIndex || 0)));
+                    const frameId = Number(ids[clamped] || 0);
+                    const fps = Number(entry.fps);
+                    const epsilon = Math.min(0.001, 0.25 / fps);
+                    let time = Math.max(0, (frameId / fps) + epsilon);
+                    if (Number.isFinite(duration) && duration >= 0) {
+                        const upper = Math.max(0, duration - epsilon);
+                        time = Math.min(upper, time);
+                    }
+                    return time;
+                },
+
+                videoTimeToFrameIndex(videoTime, videoKey) {
+                    const entry = this.getVideoSeekEntry(videoKey);
+                    if (!entry) {
+                        return this.timeToFrameIndex(videoTime);
+                    }
+                    return this.nearestSortedIndex(entry.frame_ids, Number(videoTime || 0) * Number(entry.fps));
+                },
+
+                updatePlaybackUiForFrame(frameIndex) {
+                    const total = Math.max(1, this.currentEpisodeFrameCount - 1);
+                    const clamped = Math.max(0, Math.min(total, Number(frameIndex || 0)));
+                    if (this.$refs.slider) {
+                        this.$refs.slider.value = ((100 * clamped) / total).toFixed(4);
+                    }
+                    if (this.$refs.frameCounter) {
+                        this.$refs.frameCounter.textContent = `Frame: ${clamped} / ${this.dygraph ? this.dygraph.numRows() : this.currentEpisodeFrameCount}`;
+                    }
+                    if (this.$refs.timer) {
+                        const currentVideoTime = Number(this.video?.currentTime || 0);
+                        const currentDuration = Number(this.video?.duration || 0);
+                        this.$refs.timer.textContent = `${this.formatTime(currentVideoTime)} / ${this.formatTime(currentDuration)}`;
+                    }
+                },
+
+                syncVideosToFrame(frameIndex) {
+                    const videos = Array.from(this.videos || []);
+                    if (!videos.length) {
+                        return;
+                    }
+                    this.pendingSeekFrameIndex = Number(frameIndex);
+                    this.suppressVideoTimeUpdate = true;
+                    videos.forEach((video, index) => {
+                        const videoKey = this.videoKeyForElement(video) || String(this.videosInfo[index]?.filename || '');
+                        const nextTime = this.frameIndexToVideoTime(frameIndex, videoKey, video.duration);
+                        video.currentTime = nextTime;
+                    });
+                    window.requestAnimationFrame(() => {
+                        this.suppressVideoTimeUpdate = false;
+                    });
+                },
+
+                applyFrameSelection(frameIndex, options = {}) {
+                    const { syncVideos = false, updateUrl = true } = options;
+                    const total = Math.max(0, this.currentEpisodeFrameCount - 1);
+                    const clamped = Math.max(0, Math.min(total, Number(frameIndex || 0)));
+                    if (syncVideos) {
+                        this.syncVideosToFrame(clamped);
+                    }
+                    const time = this.frameIndexToTime(clamped);
+                    this.dygraphIndex = clamped;
+                    this.dygraphTime = time;
+                    if (this.dygraph) {
+                        this.dygraph.setSelection(clamped, undefined, true, true);
+                    }
+                    this.updateTableValues(time);
+                    this.syncRobotPose(time);
+                    this.updatePlaybackUiForFrame(clamped);
+                    if (updateUrl && Number.isFinite(time)) {
+                        this.updateTimeQuery(this.formatFixed(time, 2));
+                    }
+                },
+
+                seekByPrimaryVideoDelta(deltaSeconds) {
+                    const primaryVideo = this.video;
+                    if (!primaryVideo) {
+                        return;
+                    }
+                    const currentTime = Number(primaryVideo.currentTime || 0);
+                    const duration = Number(primaryVideo.duration || 0);
+                    const targetTime = Math.max(0, Math.min(duration || currentTime + deltaSeconds, currentTime + deltaSeconds));
+                    const targetFrame = this.videoTimeToFrameIndex(targetTime, this.videoKeyForElement(primaryVideo));
+                    this.seekToFrame(targetFrame);
                 },
 
                 async buildDygraphFromCurrentEpisode(useUrlTime = false) {
@@ -2240,7 +2391,7 @@
                                             },
                                             highlightCallback: (event, x, points, row, seriesName) => {
                                                 const t = Number(x);
-                                                const nextTime = Number.isFinite(t) ? t : (this.video?.currentTime ?? 0);
+                                                const nextTime = Number.isFinite(t) ? t : this.frameIndexToTime(this.dygraphIndex);
                                                 this.dygraphTime = nextTime;
                                                 if (Number.isFinite(row)) {
                                                     this.dygraphIndex = row;
@@ -2292,9 +2443,10 @@
                                                     this.updateTableValues();
                                                     this.$refs.frameCounter.textContent = 'Frame: 0 / ' + this.dygraph.numRows();
 
-                                                    if (Number.isFinite(initialUrlTime)) {
-                                                        this.videos.forEach(video => (video.currentTime = initialUrlTime));
-                                                    }
+                                                    const initialFrameIndex = Number.isFinite(initialUrlTime)
+                                                        ? this.timeToFrameIndex(initialUrlTime)
+                                                        : 0;
+                                                    this.applyFrameSelection(initialFrameIndex, { syncVideos: true, updateUrl: false });
 
                                                     const initialDriver = this.robotConfig.default_driver;
                                                     if (initialDriver && initialDriver in this.robotDriverLookup) {
@@ -2324,11 +2476,7 @@
                         if (useUrlTime) {
                             const timeFromUrl = this.parseTimeFromUrl();
                             if (Number.isFinite(timeFromUrl)) {
-                                (this.videos || []).forEach((video) => {
-                                    video.currentTime = timeFromUrl;
-                                });
-                                this.updateTableValues(timeFromUrl);
-                                this.syncRobotPose(timeFromUrl);
+                                this.seekToFrame(this.timeToFrameIndex(timeFromUrl));
                             }
                         }
                         return;
@@ -2386,42 +2534,27 @@
                     if (!videoElement.duration) {
                         return;
                     }
+                    if (this.suppressVideoTimeUpdate) {
+                        return;
+                    }
+                    if (!this.playbackActive && Number.isFinite(Number(this.pendingSeekFrameIndex))) {
+                        const lockedFrameIndex = Number(this.pendingSeekFrameIndex);
+                        this.pendingSeekFrameIndex = null;
+                        this.applyFrameSelection(lockedFrameIndex, { syncVideos: false, updateUrl: true });
+                        return;
+                    }
 
                     const time = videoElement.currentTime;
-                    const frameIndex = this.timeToFrameIndex(time);
-                    const pc = (100 / videoElement.duration) * time;
-
-                    if (this.$refs.slider) {
-                        this.$refs.slider.value = pc;
-                    }
-                    this.dygraphTime = time;
-                    this.dygraphIndex = frameIndex;
-                    this.dygraph.setSelection(frameIndex, undefined, true, true);
-                    this.syncRobotPose(time);
-                    this.updateTableValues(time);
-
-                    if (this.$refs.timer) {
-                        this.$refs.timer.textContent = `${this.formatTime(time)} / ${this.formatTime(videoElement.duration)}`;
-                    }
-                    if (this.$refs.frameCounter) {
-                        this.$refs.frameCounter.textContent = `Frame: ${frameIndex} / ${this.dygraph.numRows()}`;
-                    }
-
-                    if (Number.isFinite(time)) {
-                        this.updateTimeQuery(this.formatFixed(time, 2));
-                    }
+                    this.pendingSeekFrameIndex = null;
+                    const frameIndex = this.videoTimeToFrameIndex(time, this.videoKeyForElement(videoElement));
+                    this.applyFrameSelection(frameIndex, { syncVideos: false, updateUrl: true });
                 },
 
                 handleVideoLoadedMetadata(videoElement) {
                     if (!videoElement) {
                         return;
                     }
-                    if (this.$refs.timer) {
-                        this.$refs.timer.textContent = `${this.formatTime(0)} / ${this.formatTime(videoElement.duration)}`;
-                    }
-                    if (this.$refs.frameCounter && this.dygraph) {
-                        this.$refs.frameCounter.textContent = `Frame: 0 / ${this.dygraph.numRows()}`;
-                    }
+                    this.updatePlaybackUiForFrame(this.currentFrameIndex);
                 },
 
                 handleGraphMouseLeave() {
@@ -2429,7 +2562,7 @@
                         return;
                     }
                     this.dygraph.setSelection(this.dygraphIndex, undefined, true, true);
-                    this.dygraphTime = this.video?.currentTime || 0;
+                    this.dygraphTime = this.frameIndexToTime(this.dygraphIndex);
                 },
 
                 handleGlobalKeydown(e) {
@@ -2449,11 +2582,8 @@
                         }
                     } else if (key === 'ArrowLeft' || key === 'ArrowRight') {
                         e.preventDefault();
-                        const delta = key === 'ArrowRight' ? (1.0 / Number(window.__DATASET_FPS__ || 1)) : -(1.0 / Number(window.__DATASET_FPS__ || 1));
-                        const videos = this.videos || document.querySelectorAll('video');
-                        videos.forEach(video => {
-                            video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + delta));
-                        });
+                        const delta = key === 'ArrowRight' ? 1 : -1;
+                        this.seekToFrame(this.currentFrameIndex + delta);
                     } else if (key === 'ArrowDown') {
                         e.preventDefault();
                         this.navigateRelativeEpisode(1);
@@ -2809,7 +2939,7 @@
                     if (!this.colors || !this.dygraph || !this.dygraph.rawData_ || this.dygraph.rawData_.length === 0) {
                         return;
                     }
-                    const sampleTime = time === undefined ? (this.video?.currentTime ?? this.dygraphTime ?? 0) : time;
+                    const sampleTime = time === undefined ? (this.dygraphTime ?? 0) : time;
                     const index = this.timeToFrameIndex(sampleTime);
                     // slice(1) to remove the timestamp point that we do not need
                     const labels = this.dygraph.getLabels().slice(1);

@@ -26,6 +26,7 @@ from scribe.data import (
     get_episode_timestamps,
     get_episode_frame_count,
 )
+from scribe.lance_backend import LanceDataset
 from scribe.annotation_store import (
     DEFAULT_SCHEME,
     SUPPORTED_SCHEMES,
@@ -332,6 +333,11 @@ def run_server(
                     }
                 )
             tasks = dataset_obj.meta.episodes[episode_id]["tasks"]
+            video_seek_info = (
+                dataset_obj.get_episode_video_seek_info(episode_id)
+                if isinstance(dataset_obj, LanceDataset)
+                else {}
+            )
         else:
             video_keys = [key for key, ft in dataset_obj.features.items() if ft["dtype"] == "video"]
             videos_info = [
@@ -354,6 +360,7 @@ def run_server(
             tasks_jsonl = [json.loads(line) for line in response.text.splitlines() if line.strip()]
             filtered_tasks_jsonl = [row for row in tasks_jsonl if row["episode_index"] == episode_id]
             tasks = filtered_tasks_jsonl[0]["tasks"]
+            video_seek_info = {}
 
         videos_info = sort_videos_by_order(videos_info)
 
@@ -378,6 +385,7 @@ def run_server(
             "episode_data_csv_str": episode_data_csv_str,
             "columns": columns,
             "ignored_columns": ignored_columns,
+            "video_seek_info": video_seek_info,
             "language_instruction": language_instruction,
             "curation_context": _build_curation_response_context(curation_context),
             "annotation_context": annotation_context,
