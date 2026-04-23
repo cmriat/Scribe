@@ -5,9 +5,11 @@ Contains run_server() which creates the Flask app, registers all routes,
 and starts the development server.
 """
 
+import os
 import re
 import json
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from threading import Lock
@@ -75,6 +77,13 @@ _episode_curation_lock = Lock()
 _segment_annotation_lock = Lock()
 _frame_event_lock = Lock()
 _task_annotation_lock = Lock()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +306,17 @@ def run_server(
         episodes_value: list[int] | None,
     ) -> dict:
         curation_context = _build_episode_curation_context(dataset_obj, repo_id)
+        # For Lance datasets, encode videos for all cameras in parallel.
+        if isinstance(dataset_obj, LanceDataset):
+            dataset_obj._preload_videos(episode_id)
+            # Preload next episode in background.
+            next_ep = episode_id + 1
+            if _env_bool("LANCE_PRELOAD_NEXT", True) and next_ep < dataset_obj.num_episodes:
+                threading.Thread(
+                    target=dataset_obj._preload_videos,
+                    args=(next_ep,),
+                    daemon=True,
+                ).start()
         episode_data_csv_str, columns, ignored_columns = get_episode_data(dataset_obj, episode_id)
         frame_count = get_episode_frame_count(dataset_obj, episode_id)
 

@@ -12,22 +12,21 @@ Design:
   landing under `runtime_dir/videos/chunk-NNN/<cam>/episode_NNNNNN.mp4`. The
   existing Flask `/local_videos/<rel>` route serves them.
 - `dataset.fps` equals the detected robot sampling rate for dygraph / robot
-  state. Video playback can additionally use per-camera `*_frame_id` arrays to
-  seek the remuxed MP4 by the exact Lance-selected frame instead of robot time.
+  state. Video playback uses per-camera MP4 frame-index arrays derived from
+  Lance GOP metadata instead of approximating frame alignment from robot time.
 """
 
 from __future__ import annotations
 
-import bisect
+import os
+import sys
+import shutil
 import hashlib
 import logging
-import shutil
-import subprocess
-import sys
 import threading
+import subprocess
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Iterable
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -63,6 +62,7 @@ FFPROBE_BIN = _find_bin("ffprobe")
 
 LANCE_SUFFIX = ".lance"
 CAMERA_KEYS_DEFAULT = ("mid", "left", "right")
+VIDEO_CACHE_VERSION = "h264copy_v1"
 
 
 def _dataset_runtime_namespace(root: Path, repo_id: str) -> str:
@@ -71,7 +71,18 @@ def _dataset_runtime_namespace(root: Path, repo_id: str) -> str:
     stem = root.stem if root.suffix == LANCE_SUFFIX else root.name
     slug = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem).strip("_") or "dataset"
     digest = hashlib.sha1(f"{root}|{repo_id}".encode("utf-8")).hexdigest()[:12]
-    return f"{slug}_{digest}"
+    return f"{slug}_{digest}_{VIDEO_CACHE_VERSION}"
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("invalid %s=%r; using %d", name, raw, default)
+        return default
 
 # Feature name → how to fetch from a lance row batch.
 # "lance_col": direct column copy (possibly list→2D stack).
@@ -146,6 +157,7 @@ class _EpisodeLance:
         }
         self._df: pd.DataFrame | None = None
         self._cam_fps: dict[str, float] = {}
+        self._video_frame_indices: dict[str, np.ndarray] = {}
         self._instruction: str | None = None
 
     @property
@@ -256,6 +268,36 @@ class _EpisodeLance:
         indices = [first_idx[g] for g in ordered]
         blobs = self._ds.take_blobs(cam, indices=indices)
         return b"".join(b.read() for b in blobs)
+
+    def video_frame_indices_for_rows(self, cam: str) -> np.ndarray:
+        """Map each robot row to the frame index in the materialized MP4.
+
+        Lance stores per-row camera GOP id and frame index within that GOP. The
+        MP4 is built by concatenating the unique GOP blobs in sorted GOP order,
+        so this derived index is the precise browser seek target for each row.
+        """
+        if cam in self._video_frame_indices:
+            return self._video_frame_indices[cam]
+
+        cols = [f"{cam}_gop_index", f"{cam}_frame_index_in_gop"]
+        df = self.read_columns(cols, offset=0, length=self.row_count)
+        gops = np.asarray(df[cols[0]], dtype=np.int64).reshape(-1)
+        frame_in_gop = np.asarray(df[cols[1]], dtype=np.int64).reshape(-1)
+
+        gop_lengths: dict[int, int] = {}
+        for gop_index, local_frame_index in zip(gops, frame_in_gop, strict=True):
+            g = int(gop_index)
+            gop_lengths[g] = max(gop_lengths.get(g, 0), int(local_frame_index) + 1)
+
+        offsets: dict[int, int] = {}
+        next_offset = 0
+        for g in sorted(gop_lengths):
+            offsets[g] = next_offset
+            next_offset += gop_lengths[g]
+
+        indices = np.asarray([offsets[int(g)] + int(i) for g, i in zip(gops, frame_in_gop, strict=True)], dtype=np.int64)
+        self._video_frame_indices[cam] = indices
+        return indices
 
 
 def _arm_joint_names_14() -> list[str]:
@@ -373,6 +415,8 @@ class LanceDataset:
         self._video_root = self._runtime_dir / "videos" / _dataset_runtime_namespace(self._root, self.repo_id)
         self._video_root.mkdir(parents=True, exist_ok=True)
         self._remux_lock = threading.Lock()
+        self._video_locks: dict[tuple[int, str], threading.Lock] = {}
+        self._video_workers = _env_int("LANCE_VIDEO_WORKERS", default=1)
 
         episode_paths = discover_lance_episodes(self._root)
         if not episode_paths:
@@ -455,22 +499,17 @@ class LanceDataset:
         return _LanceHFShim(self)
 
     def get_episode_video_seek_info(self, episode_index: int) -> dict[str, dict[str, object]]:
-        """Return per-camera frame-id arrays and fps for precise browser seeks."""
+        """Return per-camera MP4 frame-index arrays and fps for precise browser seeks."""
         ep_idx = int(episode_index)
         ep = self._episodes[ep_idx]
-        columns = [f"{cam}_frame_id" for cam in ep.cameras]
-        if not columns:
+        if not ep.cameras:
             return {}
-        frame_df = ep.read_columns(columns, offset=0, length=ep.row_count)
         out: dict[str, dict[str, object]] = {}
         for cam in ep.cameras:
-            col = f"{cam}_frame_id"
-            if col not in frame_df.columns:
-                continue
-            frame_ids = np.asarray(frame_df[col], dtype=np.int64).reshape(-1)
+            frame_indices = ep.video_frame_indices_for_rows(cam)
             out[f"observation.images.{cam}"] = {
                 "fps": float(ep.camera_fps(cam)),
-                "frame_ids": frame_ids.tolist(),
+                "video_frame_indices": frame_indices.tolist(),
             }
         return out
 
@@ -562,25 +601,30 @@ class LanceDataset:
         out = self._video_path(episode_index, cam)
         if out.exists() and out.stat().st_size > 0:
             return out
+        # Per-video lock so different cameras can encode in parallel.
+        lock_key = (episode_index, cam)
         with self._remux_lock:
+            if lock_key not in self._video_locks:
+                self._video_locks[lock_key] = threading.Lock()
+            vlock = self._video_locks[lock_key]
+        with vlock:
             if out.exists() and out.stat().st_size > 0:
                 return out
             out.parent.mkdir(parents=True, exist_ok=True)
             ep = self._episodes[episode_index]
             fps = ep.camera_fps(cam)
-            logger.info(
-                "LanceDataset: remuxing ep=%d cam=%s fps=%.3f → %s",
-                episode_index, cam, fps, out,
-            )
+            logger.info("LanceDataset: remuxing ep=%d cam=%s fps=%.3f -> %s", episode_index, cam, fps, out)
             raw = ep.concatenate_gops(cam)
             tmp = out.with_suffix(".mp4.part")
             try:
                 r = subprocess.run(
                     [
                         FFMPEG_BIN, "-y", "-loglevel", "error",
+                        "-fflags", "+genpts",
                         "-f", "h264", "-framerate", f"{fps:.6f}",
                         "-i", "-",
-                        "-c", "copy", "-movflags", "+faststart",
+                        "-c:v", "copy",
+                        "-movflags", "+faststart",
                         "-f", "mp4",
                         str(tmp),
                     ],
@@ -588,7 +632,28 @@ class LanceDataset:
                     capture_output=True,
                 )
                 if r.returncode != 0:
-                    raise RuntimeError(f"ffmpeg remux failed: {r.stderr.decode()[:500]}")
+                    logger.warning(
+                        "copy remux failed ep=%d cam=%s: %s; falling back to intra-frame encode",
+                        episode_index,
+                        cam,
+                        r.stderr.decode(errors="replace")[:500],
+                    )
+                    r = subprocess.run(
+                        [
+                            FFMPEG_BIN, "-y", "-loglevel", "error",
+                            "-f", "h264", "-framerate", f"{fps:.6f}",
+                            "-i", "-",
+                            "-c:v", "libx264", "-preset", "ultrafast",
+                            "-crf", "18", "-g", "1",
+                            "-movflags", "+faststart",
+                            "-f", "mp4",
+                            str(tmp),
+                        ],
+                        input=raw,
+                        capture_output=True,
+                    )
+                    if r.returncode != 0:
+                        raise RuntimeError(f"ffmpeg encode failed: {r.stderr.decode(errors='replace')[:500]}")
                 tmp.replace(out)
             finally:
                 if tmp.exists():
@@ -597,6 +662,17 @@ class LanceDataset:
                     except OSError:
                         pass
         return out
+
+    def _preload_videos(self, episode_index: int) -> None:
+        """Materialize all cameras for an episode, with bounded concurrency."""
+        def _encode(cam: str):
+            try:
+                self._ensure_video(episode_index, cam)
+            except Exception:
+                logger.warning("preload failed ep=%d cam=%s", episode_index, cam, exc_info=True)
+        max_workers = min(len(self._cameras), self._video_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            pool.map(_encode, self._cameras)
 
     # ---- Feature dict construction -------------------------------------------
 

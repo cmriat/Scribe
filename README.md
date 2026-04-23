@@ -11,6 +11,7 @@
 - Dygraph 时序曲线（关节状态、动作等）
 - SBS1 双臂 3D 模型联动（URDF 驱动）
 - 表格数据勾选显隐
+- 本地 Lance 数据集按需可视化（保持原始帧/机械臂数据对齐）
 
 **标注**
 - Episode 级 Curation（Keep / Delete 标记）
@@ -88,12 +89,44 @@ python -m scribe \
 ARM3D=false pixi run serve   # 关闭 3D 面板
 ```
 
+### Lance 数据集可视化
+
+当 `--root` / `DATASET_ROOT` 指向单个 `.lance` 目录或包含 `episode_*.lance` 的目录时，后端会自动使用 `LanceDataset`：
+
+```bash
+DATASET_ROOT=/path/to/lance_root REPO_ID=local/my-dataset pixi run serve
+```
+
+如果环境中的 `lance` 缺少 `Blob` / `blob_array` 支持，可以使用固定版本安装任务：
+
+```bash
+pixi run build-pylance        # 从 fecet/lance 固定 commit 源码编译安装
+pixi run build-pylance-wheel  # 使用 third_party 中已缓存的 pylance wheel 安装，不重装 pixi 依赖
+```
+
+Lance 视频会按需 materialize 到 `.visualizer_runtime/lance_runtime/videos/` 下。默认不会在启动时全量扫描并生成所有 episode，避免大量 CPU/磁盘 IO 影响实时浏览。
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `LANCE_PREENCODE_ALL` | `false` | 是否启动后后台 materialize 全部 episode 视频 |
+| `LANCE_PRELOAD_NEXT` | `true` | 打开当前 episode 后是否后台预加载下一个 episode |
+| `LANCE_VIDEO_WORKERS` | `1` | Lance 视频 materialize 并发数 |
+
+对齐原则：
+
+- 机械臂时序数据保持 Lance 原始采样行，不做行降采样。
+- 视频优先将 Lance 中的 H264 GOP 直接 copy remux 为 MP4；仅在 copy remux 失败时才回退到编码。
+- 前端使用 Lance 的 `*_gop_index` 与 `*_frame_index_in_gop` 推导出的 MP4 内部帧号进行 seek，确保每一行机械臂数据对应原始 Lance 记录中的相机帧。
+- 播放时优先使用浏览器 `requestVideoFrameCallback` 按实际呈现的视频帧同步曲线、表格和 3D 机械臂。
+
 ## Pixi Tasks
 
 | 命令 | 说明 |
 |------|------|
 | `pixi run serve` | 启动可视化服务器 |
 | `pixi run vendor` | 下载前端 vendor 依赖 |
+| `pixi run build-pylance` | 从固定 commit 编译安装支持 Lance blob 的 pylance |
+| `pixi run build-pylance-wheel` | 从 `third_party/` 缓存 wheel 安装 pylance，不重装 pixi 依赖 |
 | `pixi run export` | 导出标注工件 |
 | `pixi run check` | 一键全量检查（lint + 格式 + 语法） |
 | `pixi run lint` | Ruff 代码检查 |

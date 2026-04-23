@@ -43,6 +43,9 @@ opencv-python-headless = ">=4.12.0,<5"
 
 # ── Tasks ──────────────────────────────────────────────────────────
 [tasks]
+# pylance 环境安装
+build-pylance = "bash scripts/install_pylance.sh"
+build-pylance-wheel = "pip install --force-reinstall --no-deps third_party/pylance-5.0.0b2-cp39-abi3-manylinux_2_28_x86_64.whl"
 # -- 开发相关 --
 # 启动可视化服务器：DATASET_ROOT=/path/to/dataset pixi run serve
 serve = "bash scripts/run.sh"
@@ -59,4 +62,3 @@ format-check = "ruff format --check scribe/"
 syntax = "python -m py_compile scribe/app.py && python -m py_compile scribe/routes.py && python -m py_compile scribe/data.py && python -m py_compile scribe/annotation_store.py && python -m py_compile scribe/export.py && echo 'Syntax OK'"
 # 一键全量检查：lint + format-check + syntax
 check = { depends-on = ["lint", "format-check", "syntax"] }
-

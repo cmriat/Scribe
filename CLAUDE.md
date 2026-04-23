@@ -2,7 +2,7 @@
 
 本文件用于帮助 AI 助手快速理解 Scribe 的结构、运行方式与当前开发状态。
 
-最后更新：2026-04-03
+最后更新：2026-04-23
 
 ---
 
@@ -10,6 +10,11 @@
 
 - 进入开发环境：`pixi shell`
 - 环境依赖更新 → 修改 `pixi.toml`
+- pylance 安装：
+  ```bash
+  pixi run build-pylance        # 从 fecet/lance 固定 commit 源码编译
+  pixi run build-pylance-wheel  # 使用 third_party 中缓存的 wheel，不重装 pixi 依赖
+  ```
 - Python 语法检查：
   ```bash
   ./.pixi/envs/default/bin/python -m py_compile \
@@ -25,6 +30,7 @@
 - 目标：可视化 + 标注 **LeRobot v2.1** 数据集（本地/Hub），核心能力分为两层：
   - **可视化层**：多相机视频同步播放、Dygraph 时序曲线、SBS1 双臂 3D 联动、表格勾选
   - **标注层**：Episode 级 curation (K/D)、Sparse stage segment 标注、Frame event 标注、离线导出训练工件
+- Lance 本地数据集可视化目标：快速按需读取，同时保持每一行机械臂数据与 Lance 记录中的相机帧严格对齐。不要通过降采样、跳帧、缩分辨率等方式牺牲“原封不动”可视化。
 
 ## 2) 快速启动
 
@@ -38,6 +44,14 @@ scripts/run.sh
 ```bash
 ARM3D=true  bash scripts/run.sh   # 显示 3D 机械臂（默认）
 ARM3D=false bash scripts/run.sh   # 关闭 3D 机械臂面板
+```
+
+Lance 性能开关：
+
+```bash
+LANCE_PREENCODE_ALL=false bash scripts/run.sh  # 默认：不启动全量视频 materialize
+LANCE_PRELOAD_NEXT=false bash scripts/run.sh   # 关闭下一个 episode 的后台预加载
+LANCE_VIDEO_WORKERS=1 bash scripts/run.sh      # 默认：限制视频 materialize 并发
 ```
 
 等价模块入口：
@@ -63,6 +77,7 @@ scripts/run.sh
          ├─ argparse 解析参数
          ├─ 构造 dataset:
          │  ├─ 本地: LeRobotDataset(repo_id, root=...)
+         │  ├─ Lance: LanceDataset(repo_id, root=..., runtime_dir=...)
          │  └─ Hub:  data.get_dataset_info(repo_id) → IterableNamespace
          └─ app.visualize_dataset_html(...)
             ├─ 准备 output_dir/static + robot/vendor 资源
@@ -119,6 +134,7 @@ scripts/run.sh
 - **`app.py`** — 应用入口：CLI 参数解析、资源准备（vendor/robot assets）、`main()` 和 `visualize_dataset_html()` 入口函数
 - **`routes.py`** — Flask 路由：所有页面和 API 路由处理函数、标注上下文构建、`run_server()` 创建 Flask app
 - **`data.py`** — 数据层：episode 数据加载、LRU 缓存、CSV 生成（Dygraph）、时间戳、视频路径
+- **`lance_backend.py`** — Lance 数据适配：episode 发现、非 blob 列读取、H264 GOP copy remux、MP4 内部帧号映射、视频缓存
 - **`annotation_store.py`** — 标注存储：Sidecar 标注数据的完整 CRUD + 校验逻辑、任务模板解析
 - **`export.py`** — 离线导出：消费 `segment_annotations.json`，产出训练工件（clip_manifest、progress parquet、stage_priors）
 
@@ -130,10 +146,21 @@ scripts/run.sh
 
 - **`scripts/run.sh`** — 启动脚本（runtime 目录、HF 缓存、ARM3D 开关）
 - **`scripts/download_vendor.sh`** — 下载前端依赖到 `scribe/vendor/`
+- **`scripts/install_pylance.sh`** — 从 `fecet/lance` 固定 commit 编译安装带 `Blob` / `blob_array` 支持的 pylance；源码 clone 到本地 `.lance-src/`
 
 ### 资源
 
 - **`robot_assets/`** — SBS1 双臂 URDF/Xacro/STL meshes
+
+## 5.1) Lance 可视化不变量
+
+- `LanceDataset` 将 robot state/action/velocity/effort 保持在原始行频率；`data.get_episode_data()` 不做行级降采样。
+- Lance 相机数据以 H264 Annex B GOP blob 存储。后端优先使用 `ffmpeg -c:v copy` 将唯一 GOP 拼接并 remux 为浏览器可播 MP4。
+- Runtime 视频缓存路径包含 `VIDEO_CACHE_VERSION`，避免新旧 MP4 策略混用。
+- `get_episode_video_seek_info()` 返回 `video_frame_indices`，由每行的 `*_gop_index` 与 `*_frame_index_in_gop` 计算得到，表示该 robot 行对应 materialized MP4 的内部帧号。
+- 前端 `frameIndexToVideoTime()` / `videoTimeToFrameIndex()` 必须优先使用 `video_frame_indices`；旧的 `frame_ids` 仅作为兼容 fallback。
+- 播放同步优先使用 `requestVideoFrameCallback`，按实际呈现视频帧驱动 Dygraph selection、表格和 3D 机械臂；无该 API 时才回退到 `timeupdate`。
+- 不要用低清预览、跳帧、只加载部分机械臂列作为默认性能优化；如果要新增此类模式，必须显式命名为 preview/debug，并默认关闭。
 
 ## 6) 标注系统数据架构
 
@@ -198,6 +225,7 @@ python -m scribe.export \
 |----------|--------|
 | 新增/修改路由 | `routes.py` → `run_server()` |
 | 标注 sidecar schema / 校验 | `annotation_store.py` |
+| Lance 读取 / 视频 materialize / 帧对齐 | `lance_backend.py` |
 | 视频显示顺序 | `data.py` → `VIDEO_DISPLAY_ORDER` |
 | 数据加载 / 缓存 | `data.py` |
 | CLI 参数 / 资源准备 | `app.py` |
@@ -210,6 +238,9 @@ python -m scribe.export \
 ## 9) 当前已知风险
 
 - 前端将 `videos[0]` 作为时间基准；若首个视频异常会影响整体联动
+- Lance 当前 episode 首次打开仍会等待该 episode 的 MP4 materialize；默认只关闭全量预生成，不跳过当前 episode 生成
+- H264 copy remux 失败时会 fallback 到 intra-frame encode，文件会更大、耗时更高
+- `requestVideoFrameCallback` 不可用的浏览器会回退到 `timeupdate`，播放同步粒度较粗
 - 标注 API 仅支持本地 `--root` 数据集，Hub 模式下标注功能 disabled
 - 缓存默认 16 个 episode，大维度数据集需关注内存
 - 标注文件写入用线程锁保护，仅限单进程安全

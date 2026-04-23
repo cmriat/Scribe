@@ -237,7 +237,8 @@ def get_episode_data(dataset: LeRobotDataset | IterableNamespace, episode_index)
     csv_buffer = StringIO()
     csv_buffer.write(",".join(header))
     csv_buffer.write("\n")
-    np.savetxt(csv_buffer, matrix, delimiter=",", fmt="%.17g")
+    csv_float_format = "%.9g" if isinstance(dataset, LanceDataset) else "%.17g"
+    np.savetxt(csv_buffer, matrix, delimiter=",", fmt=csv_float_format)
     csv_string = csv_buffer.getvalue()
 
     result = (csv_string, columns, ignored_columns)

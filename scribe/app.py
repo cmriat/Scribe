@@ -2,19 +2,21 @@
 Application entry point — CLI argument parsing, asset preparation, and server startup.
 """
 
+import os
 import re
 import time
 import shutil
 import logging
 import argparse
 import tempfile
+import threading
 from pathlib import Path
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from scribe.data import get_dataset_info
-from scribe.lance_backend import LanceDataset, is_lance_root
 from scribe.routes import run_server
+from scribe.lance_backend import LanceDataset, is_lance_root
 
 # ---------------------------------------------------------------------------
 # Robot asset constants
@@ -274,6 +276,13 @@ def _parse_bool_flag(value, flag_name: str) -> bool:
     raise ValueError(f"Invalid value for {flag_name}: '{value}'. Use true/false.")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return _parse_bool_flag(value, name)
+
+
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
@@ -452,6 +461,17 @@ def main():
             runtime_dir = Path(output_dir_arg) / "lance_runtime"
             logging.info("detected lance root at %s; using runtime dir %s", root, runtime_dir)
             dataset = LanceDataset(repo_id=repo_id, root=root, runtime_dir=runtime_dir)
+            if _env_bool("LANCE_PREENCODE_ALL", False):
+                def _bg_encode():
+                    for ep_i in range(dataset.num_episodes):
+                        try:
+                            dataset._preload_videos(ep_i)
+                        except Exception:
+                            logging.warning("background video materialization failed ep=%d", ep_i, exc_info=True)
+                    logging.info("background video materialization complete (%d episodes)", dataset.num_episodes)
+                threading.Thread(target=_bg_encode, daemon=True).start()
+            else:
+                logging.info("Lance full-dataset video pre-materialization disabled (LANCE_PREENCODE_ALL=false)")
         else:
             dataset = (
                 LeRobotDataset(repo_id, root=root, tolerance_s=tolerance_s)

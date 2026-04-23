@@ -1,6 +1,7 @@
 # Runtime/cache directories (machine-local)
 .hf_cache/
 .visualizer_runtime/
+.lance-src/
 
 # Python cache/artifacts
 __pycache__/
