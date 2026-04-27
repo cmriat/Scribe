@@ -462,6 +462,7 @@ def main():
             logging.info("detected lance root at %s; using runtime dir %s", root, runtime_dir)
             dataset = LanceDataset(repo_id=repo_id, root=root, runtime_dir=runtime_dir)
             if _env_bool("LANCE_PREENCODE_ALL", False):
+
                 def _bg_encode():
                     for ep_i in range(dataset.num_episodes):
                         try:
@@ -469,6 +470,7 @@ def main():
                         except Exception:
                             logging.warning("background video materialization failed ep=%d", ep_i, exc_info=True)
                     logging.info("background video materialization complete (%d episodes)", dataset.num_episodes)
+
                 threading.Thread(target=_bg_encode, daemon=True).start()
             else:
                 logging.info("Lance full-dataset video pre-materialization disabled (LANCE_PREENCODE_ALL=false)")

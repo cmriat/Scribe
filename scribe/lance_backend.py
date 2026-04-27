@@ -26,6 +26,7 @@ import logging
 import threading
 import subprocess
 from pathlib import Path
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -52,9 +53,7 @@ def _find_bin(name: str) -> str:
     found = shutil.which(name)
     if found:
         return found
-    raise FileNotFoundError(
-        f"{name!r} not found in {env_bin} or PATH. Install ffmpeg into the pixi env."
-    )
+    raise FileNotFoundError(f"{name!r} not found in {env_bin} or PATH. Install ffmpeg into the pixi env.")
 
 
 FFMPEG_BIN = _find_bin("ffmpeg")
@@ -63,6 +62,12 @@ FFPROBE_BIN = _find_bin("ffprobe")
 LANCE_SUFFIX = ".lance"
 CAMERA_KEYS_DEFAULT = ("mid", "left", "right")
 VIDEO_CACHE_VERSION = "h264copy_v1"
+
+
+@dataclass(frozen=True)
+class _GopLayout:
+    first_indices: list[int]
+    video_frame_indices: np.ndarray
 
 
 def _dataset_runtime_namespace(root: Path, repo_id: str) -> str:
@@ -83,6 +88,7 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     except ValueError:
         logger.warning("invalid %s=%r; using %d", name, raw, default)
         return default
+
 
 # Feature name → how to fetch from a lance row batch.
 # "lance_col": direct column copy (possibly list→2D stack).
@@ -151,12 +157,14 @@ class _EpisodeLance:
         self._row_count = int(self._ds.count_rows())
         raw_meta = self._ds.schema.metadata or {}
         self.schema_meta: dict[str, str] = {
-            (k.decode() if isinstance(k, bytes) else k):
-                (v.decode() if isinstance(v, bytes) else v)
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
             for k, v in raw_meta.items()
         }
+        self._cache_lock = threading.RLock()
+        self._slice_cache: dict = {}
         self._df: pd.DataFrame | None = None
         self._cam_fps: dict[str, float] = {}
+        self._gop_layouts: dict[str, _GopLayout] = {}
         self._video_frame_indices: dict[str, np.ndarray] = {}
         self._instruction: str | None = None
 
@@ -178,9 +186,7 @@ class _EpisodeLance:
         if self._instruction is None:
             if "language_instruction" in {f.name for f in self._ds.schema}:
                 tbl = self._ds.to_table(columns=["language_instruction"], limit=1)
-                self._instruction = (
-                    str(tbl.column("language_instruction")[0].as_py() or "") if tbl.num_rows else ""
-                )
+                self._instruction = str(tbl.column("language_instruction")[0].as_py() or "") if tbl.num_rows else ""
             else:
                 self._instruction = ""
         return self._instruction
@@ -202,16 +208,16 @@ class _EpisodeLance:
         columns still avoids materializing the blob bytes themselves.
         """
         key = (offset, length, tuple(columns))
-        if not hasattr(self, "_slice_cache"):
-            self._slice_cache: dict = {}
-        if key in self._slice_cache:
-            return self._slice_cache[key]
+        with self._cache_lock:
+            if key in self._slice_cache:
+                return self._slice_cache[key]
         tbl = self._ds.to_table(columns=list(columns), limit=length, offset=offset)
         df = tbl.to_pandas()
-        self._slice_cache[key] = df
-        # tiny LRU to avoid unbounded growth
-        if len(self._slice_cache) > 8:
-            self._slice_cache.pop(next(iter(self._slice_cache)))
+        with self._cache_lock:
+            self._slice_cache[key] = df
+            # tiny LRU to avoid unbounded growth
+            if len(self._slice_cache) > 8:
+                self._slice_cache.pop(next(iter(self._slice_cache)))
         return df
 
     def _first_last(self, column: str):
@@ -254,39 +260,23 @@ class _EpisodeLance:
         self._cam_res[cam] = (w, h)
         return self._cam_res[cam]
 
-    def concatenate_gops(self, cam: str) -> bytes:
-        """Return raw H264 Annex B bytes for this episode+cam (unique GOPs in order)."""
-        gop_col = f"{cam}_gop_index"
-        tbl = self._ds.to_table(columns=[gop_col])
-        gops = tbl.column(gop_col).to_numpy()
-        first_idx: dict[int, int] = {}
-        for i, g in enumerate(gops):
-            gi = int(g)
-            if gi not in first_idx:
-                first_idx[gi] = i
-        ordered = sorted(first_idx.keys())
-        indices = [first_idx[g] for g in ordered]
-        blobs = self._ds.take_blobs(cam, indices=indices)
-        return b"".join(b.read() for b in blobs)
-
-    def video_frame_indices_for_rows(self, cam: str) -> np.ndarray:
-        """Map each robot row to the frame index in the materialized MP4.
-
-        Lance stores per-row camera GOP id and frame index within that GOP. The
-        MP4 is built by concatenating the unique GOP blobs in sorted GOP order,
-        so this derived index is the precise browser seek target for each row.
-        """
-        if cam in self._video_frame_indices:
-            return self._video_frame_indices[cam]
+    def _gop_layout(self, cam: str) -> _GopLayout:
+        """Return GOP first-row indices and row->video-frame mapping for one camera."""
+        with self._cache_lock:
+            if cam in self._gop_layouts:
+                return self._gop_layouts[cam]
 
         cols = [f"{cam}_gop_index", f"{cam}_frame_index_in_gop"]
         df = self.read_columns(cols, offset=0, length=self.row_count)
         gops = np.asarray(df[cols[0]], dtype=np.int64).reshape(-1)
         frame_in_gop = np.asarray(df[cols[1]], dtype=np.int64).reshape(-1)
 
+        first_idx: dict[int, int] = {}
         gop_lengths: dict[int, int] = {}
-        for gop_index, local_frame_index in zip(gops, frame_in_gop, strict=True):
+        for i, (gop_index, local_frame_index) in enumerate(zip(gops, frame_in_gop, strict=True)):
             g = int(gop_index)
+            if g not in first_idx:
+                first_idx[g] = i
             gop_lengths[g] = max(gop_lengths.get(g, 0), int(local_frame_index) + 1)
 
         offsets: dict[int, int] = {}
@@ -295,9 +285,36 @@ class _EpisodeLance:
             offsets[g] = next_offset
             next_offset += gop_lengths[g]
 
-        indices = np.asarray([offsets[int(g)] + int(i) for g, i in zip(gops, frame_in_gop, strict=True)], dtype=np.int64)
-        self._video_frame_indices[cam] = indices
-        return indices
+        layout = _GopLayout(
+            first_indices=[first_idx[g] for g in sorted(first_idx)],
+            video_frame_indices=np.asarray(
+                [offsets[int(g)] + int(i) for g, i in zip(gops, frame_in_gop, strict=True)],
+                dtype=np.int64,
+            ),
+        )
+        with self._cache_lock:
+            self._gop_layouts[cam] = layout
+            self._video_frame_indices[cam] = layout.video_frame_indices
+        return layout
+
+    def write_h264_gops(self, cam: str, stream) -> None:
+        """Write unique H264 GOP blobs to a file-like stream without joining them in memory."""
+        layout = self._gop_layout(cam)
+        blobs = self._ds.take_blobs(cam, indices=layout.first_indices)
+        for blob in blobs:
+            stream.write(blob.read())
+
+    def video_frame_indices_for_rows(self, cam: str) -> np.ndarray:
+        """Map each robot row to the frame index in the materialized MP4.
+
+        Lance stores per-row camera GOP id and frame index within that GOP. The
+        MP4 is built by concatenating the unique GOP blobs in sorted GOP order,
+        so this derived index is the precise browser seek target for each row.
+        """
+        with self._cache_lock:
+            if cam in self._video_frame_indices:
+                return self._video_frame_indices[cam]
+        return self._gop_layout(cam).video_frame_indices
 
 
 def _arm_joint_names_14() -> list[str]:
@@ -314,9 +331,18 @@ def _probe_h264_wh(h264_bytes: bytes) -> tuple[int, int] | None:
     try:
         r = subprocess.run(
             [
-                FFPROBE_BIN, "-v", "error", "-f", "h264",
-                "-select_streams", "v:0", "-show_entries", "stream=width,height",
-                "-of", "csv=p=0", "-",
+                FFPROBE_BIN,
+                "-v",
+                "error",
+                "-f",
+                "h264",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                "-",
             ],
             input=h264_bytes,
             capture_output=True,
@@ -340,7 +366,7 @@ def _probe_h264_wh(h264_bytes: bytes) -> tuple[int, int] | None:
 class _LanceHFShim:
     """Chain-call shim mimicking the subset of HF datasets API scribe uses:
 
-        dataset.hf_dataset.select(range(a, b)).select_columns([...]).with_format("numpy")[:]
+    dataset.hf_dataset.select(range(a, b)).select_columns([...]).with_format("numpy")[:]
     """
 
     def __init__(self, parent: "LanceDataset", rng: range | None = None, cols: list[str] | None = None):
@@ -416,7 +442,7 @@ class LanceDataset:
         self._video_root.mkdir(parents=True, exist_ok=True)
         self._remux_lock = threading.Lock()
         self._video_locks: dict[tuple[int, str], threading.Lock] = {}
-        self._video_workers = _env_int("LANCE_VIDEO_WORKERS", default=1)
+        self._video_workers = _env_int("LANCE_VIDEO_WORKERS", default=3)
 
         episode_paths = discover_lance_episodes(self._root)
         if not episode_paths:
@@ -591,10 +617,7 @@ class LanceDataset:
     def _video_path(self, episode_index: int, cam: str) -> Path:
         chunk = episode_index // 1000
         return (
-            self._video_root
-            / f"chunk-{chunk:03d}"
-            / f"observation.images.{cam}"
-            / f"episode_{episode_index:06d}.mp4"
+            self._video_root / f"chunk-{chunk:03d}" / f"observation.images.{cam}" / f"episode_{episode_index:06d}.mp4"
         )
 
     def _ensure_video(self, episode_index: int, cam: str) -> Path:
@@ -614,22 +637,32 @@ class LanceDataset:
             ep = self._episodes[episode_index]
             fps = ep.camera_fps(cam)
             logger.info("LanceDataset: remuxing ep=%d cam=%s fps=%.3f -> %s", episode_index, cam, fps, out)
-            raw = ep.concatenate_gops(cam)
             tmp = out.with_suffix(".mp4.part")
             try:
-                r = subprocess.run(
+                r = self._run_ffmpeg_with_episode_stream(
+                    ep,
+                    cam,
                     [
-                        FFMPEG_BIN, "-y", "-loglevel", "error",
-                        "-fflags", "+genpts",
-                        "-f", "h264", "-framerate", f"{fps:.6f}",
-                        "-i", "-",
-                        "-c:v", "copy",
-                        "-movflags", "+faststart",
-                        "-f", "mp4",
+                        FFMPEG_BIN,
+                        "-y",
+                        "-loglevel",
+                        "error",
+                        "-fflags",
+                        "+genpts",
+                        "-f",
+                        "h264",
+                        "-framerate",
+                        f"{fps:.6f}",
+                        "-i",
+                        "-",
+                        "-c:v",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        "-f",
+                        "mp4",
                         str(tmp),
                     ],
-                    input=raw,
-                    capture_output=True,
                 )
                 if r.returncode != 0:
                     logger.warning(
@@ -638,19 +671,34 @@ class LanceDataset:
                         cam,
                         r.stderr.decode(errors="replace")[:500],
                     )
-                    r = subprocess.run(
+                    r = self._run_ffmpeg_with_episode_stream(
+                        ep,
+                        cam,
                         [
-                            FFMPEG_BIN, "-y", "-loglevel", "error",
-                            "-f", "h264", "-framerate", f"{fps:.6f}",
-                            "-i", "-",
-                            "-c:v", "libx264", "-preset", "ultrafast",
-                            "-crf", "18", "-g", "1",
-                            "-movflags", "+faststart",
-                            "-f", "mp4",
+                            FFMPEG_BIN,
+                            "-y",
+                            "-loglevel",
+                            "error",
+                            "-f",
+                            "h264",
+                            "-framerate",
+                            f"{fps:.6f}",
+                            "-i",
+                            "-",
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "ultrafast",
+                            "-crf",
+                            "18",
+                            "-g",
+                            "1",
+                            "-movflags",
+                            "+faststart",
+                            "-f",
+                            "mp4",
                             str(tmp),
                         ],
-                        input=raw,
-                        capture_output=True,
                     )
                     if r.returncode != 0:
                         raise RuntimeError(f"ffmpeg encode failed: {r.stderr.decode(errors='replace')[:500]}")
@@ -663,16 +711,53 @@ class LanceDataset:
                         pass
         return out
 
+    @staticmethod
+    def _run_ffmpeg_with_episode_stream(ep: _EpisodeLance, cam: str, cmd: list[str]) -> subprocess.CompletedProcess:
+        """Run ffmpeg while streaming GOP blobs to stdin to avoid one large bytes join."""
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        stderr = b""
+        try:
+            assert proc.stdin is not None
+            ep.write_h264_gops(cam, proc.stdin)
+            proc.stdin.close()
+            assert proc.stderr is not None
+            stderr = proc.stderr.read()
+            returncode = proc.wait()
+            return subprocess.CompletedProcess(cmd, returncode, stdout=b"", stderr=stderr)
+        except BrokenPipeError:
+            if proc.stderr is not None:
+                stderr = proc.stderr.read()
+            returncode = proc.wait()
+            return subprocess.CompletedProcess(cmd, returncode, stdout=b"", stderr=stderr)
+        except Exception:
+            proc.kill()
+            proc.wait()
+            raise
+
     def _preload_videos(self, episode_index: int) -> None:
         """Materialize all cameras for an episode, with bounded concurrency."""
+        errors: list[tuple[str, Exception]] = []
+
         def _encode(cam: str):
             try:
                 self._ensure_video(episode_index, cam)
-            except Exception:
+            except Exception as exc:
+                errors.append((cam, exc))
                 logger.warning("preload failed ep=%d cam=%s", episode_index, cam, exc_info=True)
+
         max_workers = min(len(self._cameras), self._video_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            pool.map(_encode, self._cameras)
+            list(pool.map(_encode, self._cameras))
+        if errors:
+            failed_cameras = ", ".join(cam for cam, _ in errors)
+            raise RuntimeError(
+                f"video materialization failed for episode {episode_index}: {failed_cameras}"
+            ) from errors[0][1]
 
     # ---- Feature dict construction -------------------------------------------
 

@@ -306,17 +306,21 @@ def run_server(
         episodes_value: list[int] | None,
     ) -> dict:
         curation_context = _build_episode_curation_context(dataset_obj, repo_id)
-        # For Lance datasets, encode videos for all cameras in parallel.
+        current_preload_thread = None
+        current_preload_errors: list[Exception] = []
         if isinstance(dataset_obj, LanceDataset):
-            dataset_obj._preload_videos(episode_id)
-            # Preload next episode in background.
-            next_ep = episode_id + 1
-            if _env_bool("LANCE_PRELOAD_NEXT", True) and next_ep < dataset_obj.num_episodes:
-                threading.Thread(
-                    target=dataset_obj._preload_videos,
-                    args=(next_ep,),
-                    daemon=True,
-                ).start()
+            # Start materialization while building the CSV/metadata payload.
+            def _preload_current_episode() -> None:
+                try:
+                    dataset_obj._preload_videos(episode_id)
+                except Exception as error:
+                    current_preload_errors.append(error)
+
+            current_preload_thread = threading.Thread(
+                target=_preload_current_episode,
+                daemon=True,
+            )
+            current_preload_thread.start()
         episode_data_csv_str, columns, ignored_columns = get_episode_data(dataset_obj, episode_id)
         frame_count = get_episode_frame_count(dataset_obj, episode_id)
 
@@ -332,6 +336,25 @@ def run_server(
         }
 
         if isinstance(dataset_obj, LOCAL_DATASET_TYPES):
+            if current_preload_thread is not None:
+                current_preload_thread.join()
+                if current_preload_errors:
+                    raise RuntimeError(
+                        f"failed to materialize videos for episode {episode_id}"
+                    ) from current_preload_errors[0]
+                next_ep = episode_id + 1
+                if _env_bool("LANCE_PRELOAD_NEXT", True) and next_ep < dataset_obj.num_episodes:
+
+                    def _preload_next_episode() -> None:
+                        try:
+                            dataset_obj._preload_videos(next_ep)
+                        except Exception:
+                            logging.warning("background video materialization failed ep=%d", next_ep, exc_info=True)
+
+                    threading.Thread(
+                        target=_preload_next_episode,
+                        daemon=True,
+                    ).start()
             video_paths = [dataset_obj.meta.get_video_file_path(episode_id, key) for key in dataset_obj.meta.video_keys]
             videos_info = []
             for video_path in video_paths:
@@ -354,9 +377,7 @@ def run_server(
                 )
             tasks = dataset_obj.meta.episodes[episode_id]["tasks"]
             video_seek_info = (
-                dataset_obj.get_episode_video_seek_info(episode_id)
-                if isinstance(dataset_obj, LanceDataset)
-                else {}
+                dataset_obj.get_episode_video_seek_info(episode_id) if isinstance(dataset_obj, LanceDataset) else {}
             )
         else:
             video_keys = [key for key, ft in dataset_obj.features.items() if ft["dtype"] == "video"]
@@ -393,7 +414,9 @@ def run_server(
         if episodes_value is None:
             episodes_value = list(
                 range(
-                    dataset_obj.num_episodes if isinstance(dataset_obj, LOCAL_DATASET_TYPES) else dataset_obj.total_episodes
+                    dataset_obj.num_episodes
+                    if isinstance(dataset_obj, LOCAL_DATASET_TYPES)
+                    else dataset_obj.total_episodes
                 )
             )
 

@@ -4,6 +4,10 @@
 
 基于 Flask 的 Web 应用，用于可视化和标注 [LeRobot v2.1](https://github.com/huggingface/lerobot) 格式的机器人操作数据集。支持本地数据集和 HuggingFace Hub 远程数据集。
 
+当前版本：v0.2.0
+
+v0.2.0 主要完成本地 Lance 数据集可视化适配：支持 `.lance` episode/episode 目录按需打开，支持三路相机 H264 GOP blob materialize 为 MP4，并保持每一行机械臂数据与原始 Lance 相机帧对齐。Lance 数据集上的标注流程尚未完成专项测试和适配，计划在下一版本处理。
+
 ## 核心功能
 
 **可视化**
@@ -27,6 +31,7 @@ Scribe/
 │   ├── app.py                   # CLI 入口、资源准备、服务启动
 │   ├── routes.py                # Flask 路由（页面 + API）
 │   ├── data.py                  # 数据加载、LRU 缓存、CSV 生成
+│   ├── lance_backend.py         # Lance 数据集适配、GOP 视频 materialize、帧映射
 │   ├── annotation_store.py      # 标注 sidecar 存储（CRUD + 校验）
 │   ├── export.py                # 离线导出脚本
 │   ├── templates/
@@ -110,7 +115,7 @@ Lance 视频会按需 materialize 到 `.visualizer_runtime/lance_runtime/videos/
 |----------|--------|------|
 | `LANCE_PREENCODE_ALL` | `false` | 是否启动后后台 materialize 全部 episode 视频 |
 | `LANCE_PRELOAD_NEXT` | `true` | 打开当前 episode 后是否后台预加载下一个 episode |
-| `LANCE_VIDEO_WORKERS` | `1` | Lance 视频 materialize 并发数 |
+| `LANCE_VIDEO_WORKERS` | `3` | Lance 视频 materialize 并发数，默认对应 left/mid/right 三路相机 |
 
 对齐原则：
 
@@ -118,6 +123,70 @@ Lance 视频会按需 materialize 到 `.visualizer_runtime/lance_runtime/videos/
 - 视频优先将 Lance 中的 H264 GOP 直接 copy remux 为 MP4；仅在 copy remux 失败时才回退到编码。
 - 前端使用 Lance 的 `*_gop_index` 与 `*_frame_index_in_gop` 推导出的 MP4 内部帧号进行 seek，确保每一行机械臂数据对应原始 Lance 记录中的相机帧。
 - 播放时优先使用浏览器 `requestVideoFrameCallback` 按实际呈现的视频帧同步曲线、表格和 3D 机械臂。
+
+#### v0.2.0 Lance 处理方案
+
+Scribe 对 Lance 的处理分为四步：
+
+1. 发现 episode
+   - 如果 `DATASET_ROOT` 本身是 `.lance` 目录，则视为单 episode。
+   - 如果 `DATASET_ROOT` 是普通目录，则扫描其中的 `episode_*.lance` 子目录。
+   - episode 按文件名稳定排序，对外映射为 Scribe 的 `episode_index`。
+
+2. 保持机械臂行数据原样
+   - `observation.state`、`action`、velocity、effort 等字段从 Lance 非 blob 列读取。
+   - `timestamp`、`frame_index`、`episode_index`、`index`、`task_index` 按 Scribe 需要补齐。
+   - 当前版本不做行降采样、不跳帧、不缩减默认机械臂列。
+
+3. materialize 相机视频
+   - Lance 相机数据以 H264 Annex B GOP blob 存储，常见 blob 列为 `left`、`mid`、`right`。
+   - 后端读取 `<cam>_gop_index` 和 `<cam>_frame_index_in_gop`，找到每个唯一 GOP 第一次出现的 row index。
+   - 唯一 GOP 按 GOP index 排序后，通过 `take_blobs()` 读取。
+   - GOP blob 逐个流式写入 ffmpeg stdin，避免把完整 episode 拼成一个大 bytes。
+   - ffmpeg 优先 `-c:v copy` 生成 MP4；失败时 fallback 到 `libx264` intra-frame encode。
+
+4. 建立 row-to-frame seek 映射
+   - `_gop_layout(cam)` 计算每个 GOP 在 materialized MP4 中的 frame offset。
+   - 每一行 robot 数据通过 `gop_offset + frame_index_in_gop` 得到 MP4 内部帧号。
+   - `get_episode_video_seek_info()` 将该映射返回给前端。
+   - 前端用该映射进行 video time 和 table/chart row 的双向同步。
+
+#### v0.2.0 性能优化
+
+- 当前 episode 的视频 materialize 与 CSV/metadata 构建并行执行，减少首次打开等待。
+- 三路相机默认并行 materialize：`LANCE_VIDEO_WORKERS=3`。
+- GOP layout 和 row-to-video-frame 映射按 episode/camera 缓存，避免重复扫描 Lance 标量列。
+- ffmpeg 输入改为流式 GOP 写入，降低 Python 内存峰值。
+- 下一集可后台预加载：`LANCE_PRELOAD_NEXT=true`。
+- materialized MP4 缓存在 `.visualizer_runtime/lance_runtime/videos/`，重复打开同一 episode 时可复用。
+
+#### v0.2.0 验证状态
+
+已验证：
+
+- `pixi run check` 通过。
+- 真实 Lance 数据 smoke test 通过：
+
+```text
+/home/jovyan/code/lance_data_collections/20260420_qz4_bigshirt/episode_0005.lance
+```
+
+验证内容包括：
+
+- `LanceDataset` 初始化。
+- 三路相机 MP4 materialize。
+- episode CSV 生成。
+- `observation.images.left` / `mid` / `right` seek 映射生成。
+- 输出 MP4 文件非空。
+
+尚未验证：
+
+- Lance 数据集上的 episode curation。
+- Lance 数据集上的 sparse segment annotation。
+- Lance 数据集上的 frame event annotation。
+- Lance 数据集上的离线 export。
+
+这些内容会作为下一版本的主要工作。
 
 ## Pixi Tasks
 

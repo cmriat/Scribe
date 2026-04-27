@@ -2,7 +2,11 @@
 
 本文件用于帮助 AI 助手快速理解 Scribe 的结构、运行方式与当前开发状态。
 
-最后更新：2026-04-23
+最后更新：2026-04-27
+
+当前版本：v0.2.0
+
+v0.2.0 主线：Lance 数据集可视化适配与性能优化。该版本已经支持本地 `.lance` episode/episode 目录进入 Scribe 的可视化界面，并完成三路相机 H264 GOP blob 到 MP4 的按需 materialize、row-to-video-frame seek 映射、原始机械臂行数据同步展示。Lance 数据集上的标注流程尚未完成专项测试，下一版本再做 Lance 标注适配和验证。
 
 ---
 
@@ -51,7 +55,7 @@ Lance 性能开关：
 ```bash
 LANCE_PREENCODE_ALL=false bash scripts/run.sh  # 默认：不启动全量视频 materialize
 LANCE_PRELOAD_NEXT=false bash scripts/run.sh   # 关闭下一个 episode 的后台预加载
-LANCE_VIDEO_WORKERS=1 bash scripts/run.sh      # 默认：限制视频 materialize 并发
+LANCE_VIDEO_WORKERS=3 bash scripts/run.sh      # 默认：三路相机并行 materialize
 ```
 
 等价模块入口：
@@ -156,11 +160,86 @@ scripts/run.sh
 
 - `LanceDataset` 将 robot state/action/velocity/effort 保持在原始行频率；`data.get_episode_data()` 不做行级降采样。
 - Lance 相机数据以 H264 Annex B GOP blob 存储。后端优先使用 `ffmpeg -c:v copy` 将唯一 GOP 拼接并 remux 为浏览器可播 MP4。
+- GOP blob 写入 ffmpeg 时必须走 stdin 流式写入，避免把完整 episode 的 H264 bytes 一次性 `join` 到 Python 内存中。
+- `LANCE_VIDEO_WORKERS` 默认值为 `3`，对应 `left` / `mid` / `right` 三路相机并行 materialize；调大前需要确认磁盘 IO 和 CPU 足够。
 - Runtime 视频缓存路径包含 `VIDEO_CACHE_VERSION`，避免新旧 MP4 策略混用。
 - `get_episode_video_seek_info()` 返回 `video_frame_indices`，由每行的 `*_gop_index` 与 `*_frame_index_in_gop` 计算得到，表示该 robot 行对应 materialized MP4 的内部帧号。
 - 前端 `frameIndexToVideoTime()` / `videoTimeToFrameIndex()` 必须优先使用 `video_frame_indices`；旧的 `frame_ids` 仅作为兼容 fallback。
 - 播放同步优先使用 `requestVideoFrameCallback`，按实际呈现视频帧驱动 Dygraph selection、表格和 3D 机械臂；无该 API 时才回退到 `timeupdate`。
 - 不要用低清预览、跳帧、只加载部分机械臂列作为默认性能优化；如果要新增此类模式，必须显式命名为 preview/debug，并默认关闭。
+
+## 5.2) v0.2.0 Lance 实现方案
+
+### 数据发现与 duck typing
+
+- `app.py` 通过 `is_lance_root(root)` 判断本地路径是否为 Lance 数据源。
+- `discover_lance_episodes(root)` 同时支持：
+  - `root` 本身是单个 `episode_xxxx.lance` 目录。
+  - `root` 是包含多个 `episode_*.lance` 子目录的数据集目录。
+- `LanceDataset` 提供 Scribe 现有代码所需的 LeRobotDataset 风格接口，包括 `repo_id`、`num_episodes`、`num_frames`、`fps`、`features`、`meta`、`hf_dataset` shim、`get_episode_video_seek_info()` 等。
+- `_EpisodeLance` 是单 episode Lance wrapper，负责 schema metadata、非 blob 列读取、相机 fps/resolution 探测、GOP layout 和 seek 映射缓存。
+
+### 机械臂数据处理
+
+- 机械臂状态/action/velocity/effort 从 Lance 非 blob 列读取，并转换成 Scribe 前端已有的 feature 结构。
+- `timestamp`、`frame_index`、`episode_index`、`index`、`task_index` 等字段按 Scribe/LeRobot 预期补齐或派生。
+- CSV 仍由 `data.get_episode_data()` 统一生成，当前版本没有为 Lance 单独做分块加载。
+- 当前版本不做行降采样，不跳过机械臂采样点。
+
+### 相机视频处理
+
+- Lance 相机列为 H264 Annex B GOP blob，常见列名为 `left`、`mid`、`right`。
+- 每个相机有配套列：
+  - `<cam>_gop_index`
+  - `<cam>_frame_index_in_gop`
+  - `<cam>_frame_id`
+  - `<cam>_timestamp_ns`
+- `_gop_layout(cam)` 一次扫描 `*_gop_index` 和 `*_frame_index_in_gop`：
+  - 记录每个 GOP 第一次出现的 Lance row index。
+  - 按 GOP index 排序，得到 materialize MP4 时的 GOP 顺序。
+  - 计算每一行 robot 数据对应 materialized MP4 的内部 frame index。
+- `write_h264_gops(cam, stream)` 使用 `take_blobs(cam, indices=first_indices)` 读取唯一 GOP，并逐个写入 ffmpeg stdin。
+- `_ensure_video()` 优先执行 `ffmpeg -c:v copy` remux；失败时 fallback 到 `libx264 -preset ultrafast -g 1`。
+- 输出 MP4 写到 `.visualizer_runtime/lance_runtime/videos/<dataset_namespace>/...`，并通过 `/local_videos/<path>` 提供给前端。
+
+### 性能策略
+
+- 默认不执行全数据集预生成：`LANCE_PREENCODE_ALL=false`。
+- 打开当前 episode 时，三路相机 materialize 与 CSV/metadata 构建并行。
+- 当前 episode 返回前会等待 materialize 完成，保证 `videos_info` 指向可访问文件。
+- 下一集按 `LANCE_PRELOAD_NEXT=true` 后台预加载，提升连续浏览体验。
+- `LANCE_VIDEO_WORKERS=3` 默认让三路相机并行生成。
+- GOP layout、row slice、video frame indices 都有 episode 内缓存，并用 `RLock` 防止并发 materialize 时 cache 竞态。
+
+### 已验证命令
+
+```bash
+pixi run check
+```
+
+真实 Lance smoke test 数据：
+
+```text
+/home/jovyan/code/lance_data_collections/20260420_qz4_bigshirt/episode_0005.lance
+```
+
+验证内容：
+
+- `LanceDataset` 初始化正常。
+- `_preload_videos(0)` 可生成三路 MP4。
+- `get_episode_data(ds, 0)` 可生成 CSV。
+- `get_episode_video_seek_info(0)` 返回 `observation.images.left` / `mid` / `right`。
+- 输出 MP4 文件非空。
+
+### v0.2.0 边界
+
+- Lance 标注能力还没有完整验证。下一版需要重点检查：
+  - `annotations/` sidecar 文件在 Lance root 下的存放位置是否符合预期。
+  - Episode index 与 `episode_*.lance` 文件排序是否与标注 API 完全一致。
+  - Segment 起止帧、frame event、episode curation 是否能正确回放和导出。
+  - 导出逻辑是否需要为 Lance 数据结构新增分支。
+- 当前 episode 首次打开仍要等待视频生成完成。
+- 超长 episode 的 CSV payload 仍可能较大，后续可改为分块数据接口。
 
 ## 6) 标注系统数据架构
 

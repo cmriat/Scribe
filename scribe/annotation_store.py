@@ -8,7 +8,6 @@ from typing import Any
 from pathlib import Path
 from datetime import datetime, timezone
 
-from lerobot.datasets.utils import IterableNamespace
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 ANNOTATIONS_DIRNAME = "annotations"
