@@ -91,7 +91,10 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 # Feature name → how to fetch from a lance row batch.
-# "lance_col": direct column copy (possibly list→2D stack).
+# "lance_col": direct column copy (possibly list→2D stack). The 2nd element is
+#              the *logical* source name as it appears in raw per-episode data
+#              (master_position / slave_position / mid / etc.); merged data uses
+#              renamed columns and is handled via column aliases — see below.
 # "derived":   computed on the fly (timestamp seconds, frame_index, etc.).
 FEATURE_SOURCE = {
     "observation.state": ("lance_col", "slave_position"),
@@ -106,6 +109,100 @@ FEATURE_SOURCE = {
     "index": ("derived", "index"),
     "task_index": ("derived", "task_index"),
 }
+
+
+# -----------------------------------------------------------------------------
+# Merged dataset (single .lance for many episodes) support
+# -----------------------------------------------------------------------------
+# build_training_lance.py output has lerobot-renamed columns (`action`,
+# `observation_state`, `observation_images_cam_*`) and packs all episodes into
+# one .lance, distinguishing them by the `episode_index` column. A signature
+# of three columns identifies this format. We then expose each episode as a
+# read-only "view" into the shared dataset, translating logical column names
+# (used by FEATURE_SOURCE and the rest of this module) back to actual schema
+# columns at read time.
+
+LANCE_MERGED_SIGNATURE_COLS = frozenset(
+    {"action", "observation_state", "episode_index"}
+)
+
+# Required logical scalar columns for a viable Lance episode (raw OR merged).
+# Used to fail loudly at construction if a column is missing — replaces the
+# silent zero-fill that the previous implementation degraded to.
+_REQUIRED_LOGICAL_SCALAR_COLS = (
+    "master_position",
+    "slave_position",
+    "timestamp",
+)
+
+_CAMERA_LOGICAL_TO_LEROBOT = {
+    "mid": "observation_images_cam_env",
+    "left": "observation_images_cam_left_wrist",
+    "right": "observation_images_cam_right_wrist",
+}
+
+
+def _merged_col_aliases() -> dict[str, str]:
+    """Logical-name → actual-schema-name map for merged-pipeline output.
+
+    Logical names are the ones the rest of this module already uses (so the
+    raw-mode call sites don't need to learn new spellings); actual names are
+    what build_training_lance.py wrote to the schema.
+    """
+    aliases = {
+        "master_position": "action",
+        "slave_position": "observation_state",
+        "master_velocity": "action_velocity",
+        "master_effort": "action_effort",
+        "slave_velocity": "observation_velocity",
+        "slave_effort": "observation_effort",
+    }
+    for cam_logical, cam_lerobot in _CAMERA_LOGICAL_TO_LEROBOT.items():
+        # Blob column itself
+        aliases[cam_logical] = cam_lerobot
+        # GOP companion columns (renamed in lockstep by build_training_lance)
+        aliases[f"{cam_logical}_gop_index"] = f"{cam_lerobot}_gop_index"
+        aliases[f"{cam_logical}_frame_index_in_gop"] = f"{cam_lerobot}_frame_index_in_gop"
+    return aliases
+
+
+def _is_merged_lance(ds: lance.LanceDataset) -> bool:
+    """True if the dataset's schema has the merged-pipeline signature columns."""
+    return LANCE_MERGED_SIGNATURE_COLS <= {f.name for f in ds.schema}
+
+
+def _split_episodes_by_index(ds: lance.LanceDataset) -> list[tuple[int, int, int]]:
+    """Group rows by the `episode_index` column, return [(ep_id, row_start, row_stop)] sorted by ep_id.
+
+    Assumes rows for one episode are contiguous within the dataset — which
+    build_training_lance.py guarantees (writes one fragment per episode in
+    sequence). This walks contiguous runs of the episode_index column rather
+    than doing a boolean mask per episode, so it's O(rows) once.
+    """
+    arr = ds.to_table(columns=["episode_index"])["episode_index"].to_numpy()
+    if len(arr) == 0:
+        return []
+    # Boundaries are positions where consecutive values differ.
+    boundaries = np.flatnonzero(np.diff(arr)) + 1
+    starts = np.concatenate(([0], boundaries))
+    stops = np.concatenate((boundaries, [len(arr)]))
+    ids = [int(arr[s]) for s in starts]
+    # Reject interleaved episode_index — happens if someone manually concatenated
+    # multiple datasets without re-sorting. We can't visualize that correctly
+    # because each episode would be split into multiple disjoint chunks; one
+    # contiguous run per episode_index is the only assumption that holds.
+    if len(ids) != len(set(ids)):
+        from collections import Counter
+        repeats = [k for k, v in Counter(ids).items() if v > 1]
+        raise RuntimeError(
+            f"merged .lance has interleaved episode_index column: episode "
+            f"id(s) {repeats[:5]}{'…' if len(repeats) > 5 else ''} appear in "
+            f"multiple non-contiguous runs. Re-build the dataset with "
+            f"contiguous per-episode rows before visualizing."
+        )
+    out = [(ids[i], int(starts[i]), int(stops[i])) for i in range(len(ids))]
+    out.sort(key=lambda t: t[0])
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -149,12 +246,50 @@ def discover_lance_episodes(root: Path) -> list[Path]:
 
 
 class _EpisodeLance:
-    """One episode_*.lance file with lazy metadata/dataframe caching."""
+    """One Lance episode with lazy metadata/dataframe caching.
 
-    def __init__(self, path: Path):
-        self.path = Path(path).resolve()
-        self._ds = lance.dataset(str(self.path))
-        self._row_count = int(self._ds.count_rows())
+    Supports two modes via the constructor classmethods:
+
+    * `from_path(path)` — raw per-episode `.lance` (one dataset per file).
+      `_row_offset = 0`, `_col_aliases = {}` (identity translation).
+
+    * `from_merged_view(...)` — view into a merged multi-episode `.lance`
+      shared across many `_EpisodeLance` siblings. `_row_offset` is the
+      episode's first global row in the shared dataset; `_col_aliases` maps
+      logical names this module already uses (`master_position`, `mid`, …)
+      to the actual schema column names produced by build_training_lance
+      (`action`, `observation_images_cam_env`, …). The rest of `_EpisodeLance`
+      always speaks in logical names; translation happens at every call site
+      that touches the lance schema.
+    """
+
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        shared_ds: lance.LanceDataset | None = None,
+        row_offset: int = 0,
+        row_count: int | None = None,
+        col_aliases: dict[str, str] | None = None,
+    ):
+        if path is not None and shared_ds is None:
+            self.path = Path(path).resolve()
+            self._ds = lance.dataset(str(self.path))
+            self._row_offset = 0
+            self._row_count = int(self._ds.count_rows())
+            self._col_aliases: dict[str, str] = {}
+        elif shared_ds is not None and path is None:
+            self.path = None
+            self._ds = shared_ds
+            self._row_offset = int(row_offset)
+            assert row_count is not None, "row_count required for merged view"
+            self._row_count = int(row_count)
+            self._col_aliases = dict(col_aliases or {})
+        else:
+            raise TypeError(
+                "_EpisodeLance: pass exactly one of `path` (raw mode) or "
+                "`shared_ds` + row_offset/row_count/col_aliases (merged view)"
+            )
         raw_meta = self._ds.schema.metadata or {}
         self.schema_meta: dict[str, str] = {
             (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
@@ -167,6 +302,36 @@ class _EpisodeLance:
         self._gop_layouts: dict[str, _GopLayout] = {}
         self._video_frame_indices: dict[str, np.ndarray] = {}
         self._instruction: str | None = None
+        # Pre-build the inverse alias map (actual → logical) for non_blob_columns.
+        self._inv_aliases: dict[str, str] = {v: k for k, v in self._col_aliases.items()}
+
+    @classmethod
+    def from_path(cls, path: Path) -> "_EpisodeLance":
+        """Raw mode: one .lance file = one episode."""
+        return cls(path)
+
+    @classmethod
+    def from_merged_view(
+        cls,
+        shared_ds: lance.LanceDataset,
+        row_offset: int,
+        row_count: int,
+        col_aliases: dict[str, str],
+    ) -> "_EpisodeLance":
+        """Merged-view mode: read [row_offset, row_offset+row_count) from a shared
+        multi-episode dataset, using `col_aliases` to translate logical column
+        names (master_position / mid / …) to the schema's actual names."""
+        return cls(
+            None,
+            shared_ds=shared_ds,
+            row_offset=row_offset,
+            row_count=row_count,
+            col_aliases=col_aliases,
+        )
+
+    def _actual(self, logical: str) -> str:
+        """Logical column name → actual schema column name."""
+        return self._col_aliases.get(logical, logical)
 
     @property
     def row_count(self) -> int:
@@ -185,7 +350,10 @@ class _EpisodeLance:
     def instruction(self) -> str:
         if self._instruction is None:
             if "language_instruction" in {f.name for f in self._ds.schema}:
-                tbl = self._ds.to_table(columns=["language_instruction"], limit=1)
+                # Read from this episode's first row (merged view: row_offset > 0).
+                tbl = self._ds.to_table(
+                    columns=["language_instruction"], limit=1, offset=self._row_offset
+                )
                 self._instruction = str(tbl.column("language_instruction")[0].as_py() or "") if tbl.num_rows else ""
             else:
                 self._instruction = ""
@@ -199,34 +367,60 @@ class _EpisodeLance:
 
     @property
     def non_blob_columns(self) -> list[str]:
-        return [f.name for f in self._ds.schema if "blob" not in str(f.type).lower()]
+        """Logical (caller-facing) names of non-blob columns.
+
+        Raw mode: identity map — actual schema names are returned.
+        Merged view: actual schema names are translated back to the logical
+        names this module uses (e.g. `action` → `master_position`), so callers
+        looking up `master_position` find it.
+        """
+        actual = [f.name for f in self._ds.schema if "blob" not in str(f.type).lower()]
+        if not self._inv_aliases:
+            return actual
+        return [self._inv_aliases.get(c, c) for c in actual]
 
     def read_columns(self, columns: list[str], offset: int, length: int) -> pd.DataFrame:
-        """Read a row range for the given non-blob columns. Cached per (offset, length, cols).
+        """Read a row range for the given non-blob columns (logical names).
 
-        lance 'fullzip' encoding reads full rows, but projecting to a few scalar
-        columns still avoids materializing the blob bytes themselves.
+        Caller's `offset` is episode-relative; we add `_row_offset` for merged
+        views. Returned DataFrame has caller's logical column names (we rename
+        from actual schema names for merged mode).
         """
         key = (offset, length, tuple(columns))
         with self._cache_lock:
             if key in self._slice_cache:
                 return self._slice_cache[key]
-        tbl = self._ds.to_table(columns=list(columns), limit=length, offset=offset)
+        actual_cols = [self._actual(c) for c in columns]
+        tbl = self._ds.to_table(
+            columns=list(actual_cols),
+            limit=length,
+            offset=self._row_offset + offset,
+        )
         df = tbl.to_pandas()
+        # Rename actual → logical so caller can index by `df["master_position"]`
+        # regardless of whether we're in raw or merged mode.
+        rename = {self._actual(c): c for c in columns if self._actual(c) != c}
+        if rename:
+            df = df.rename(columns=rename)
         with self._cache_lock:
             self._slice_cache[key] = df
-            # tiny LRU to avoid unbounded growth
             if len(self._slice_cache) > 8:
                 self._slice_cache.pop(next(iter(self._slice_cache)))
         return df
 
     def _first_last(self, column: str):
-        """Fetch column value at row 0 and row (row_count-1). Cheap vs full scan
-        because lance 'fullzip' reads whole rows — we only touch 2 rows."""
+        """Fetch column value at this episode's first and last rows. Cheap vs
+        full scan: lance 'fullzip' encoding reads full rows but projection
+        means we only touch 2 rows. `column` is a logical name."""
         if self._row_count == 0:
             return None, None
-        first = self._ds.to_table(columns=[column], limit=1).column(column)[0].as_py()
-        last = self._ds.to_table(columns=[column], limit=1, offset=self._row_count - 1).column(column)[0].as_py()
+        actual = self._actual(column)
+        first = self._ds.to_table(
+            columns=[actual], limit=1, offset=self._row_offset
+        ).column(actual)[0].as_py()
+        last = self._ds.to_table(
+            columns=[actual], limit=1, offset=self._row_offset + self._row_count - 1
+        ).column(actual)[0].as_py()
         return first, last
 
     def robot_fps(self) -> float:
@@ -250,18 +444,25 @@ class _EpisodeLance:
         return self._cam_fps[cam]
 
     def camera_resolution(self, cam: str) -> tuple[int, int]:
-        """Peek first GOP, return (width, height) via ffprobe. Cached."""
+        """Peek this episode's first GOP, return (width, height) via ffprobe. Cached.
+
+        `cam` is a logical name ("mid"/"left"/"right"). We translate to the
+        actual blob column and read this episode's first row (row_offset, not
+        global row 0 — important for merged views).
+        """
         if not hasattr(self, "_cam_res"):
             self._cam_res: dict[str, tuple[int, int]] = {}
         if cam in self._cam_res:
             return self._cam_res[cam]
-        blob = self._ds.take_blobs(cam, indices=[0])[0].read()
+        actual_blob = self._actual(cam)
+        blob = self._ds.take_blobs(actual_blob, indices=[self._row_offset])[0].read()
         w, h = _probe_h264_wh(blob) or (640, 480)
         self._cam_res[cam] = (w, h)
         return self._cam_res[cam]
 
     def _gop_layout(self, cam: str) -> _GopLayout:
-        """Return GOP first-row indices and row->video-frame mapping for one camera."""
+        """Return GOP first-row indices (this episode's local rows) and
+        row→video-frame mapping for one camera."""
         with self._cache_lock:
             if cam in self._gop_layouts:
                 return self._gop_layouts[cam]
@@ -298,9 +499,17 @@ class _EpisodeLance:
         return layout
 
     def write_h264_gops(self, cam: str, stream) -> None:
-        """Write unique H264 GOP blobs to a file-like stream without joining them in memory."""
+        """Write unique H264 GOP blobs to a file-like stream without joining them in memory.
+
+        `_gop_layout.first_indices` are episode-local rows (0..row_count-1);
+        for merged views we add `_row_offset` so `take_blobs` indexes the
+        shared dataset correctly. The blob column itself is translated from
+        logical (`mid`) to actual (`observation_images_cam_env`) for merged.
+        """
         layout = self._gop_layout(cam)
-        blobs = self._ds.take_blobs(cam, indices=layout.first_indices)
+        actual_blob = self._actual(cam)
+        global_indices = [self._row_offset + i for i in layout.first_indices]
+        blobs = self._ds.take_blobs(actual_blob, indices=global_indices)
         for blob in blobs:
             stream.write(blob.read())
 
@@ -444,17 +653,82 @@ class LanceDataset:
         self._video_locks: dict[tuple[int, str], threading.Lock] = {}
         self._video_workers = _env_int("LANCE_VIDEO_WORKERS", default=3)
 
-        episode_paths = discover_lance_episodes(self._root)
-        if not episode_paths:
-            raise FileNotFoundError(
-                f"No .lance episodes discovered under {self._root}. "
-                "Pass either a single foo.lance directory or a directory containing episode_*.lance."
+        # Detect merged-pipeline output at the root: a single .lance whose
+        # schema has the {action, observation_state, episode_index} signature.
+        # Otherwise fall back to the legacy raw-per-episode discovery (one
+        # .lance per file).
+        self._is_merged = False
+        if self._root.is_dir() and (self._root / "_versions").exists():
+            try:
+                root_ds = lance.dataset(str(self._root))
+                if _is_merged_lance(root_ds):
+                    self._is_merged = True
+                    self._merged_ds = root_ds
+            except Exception as exc:
+                logger.debug("LanceDataset: not a merged-pipeline root (%s)", exc)
+
+        if self._is_merged:
+            episodes_meta = _split_episodes_by_index(self._merged_ds)
+            if not episodes_meta:
+                raise RuntimeError(
+                    f"{self._root}: merged-pipeline signature detected but episode_index "
+                    "column produced 0 episodes — dataset may be empty or corrupted."
+                )
+            aliases = _merged_col_aliases()
+            self._episodes = [
+                _EpisodeLance.from_merged_view(
+                    shared_ds=self._merged_ds,
+                    row_offset=row_start,
+                    row_count=row_stop - row_start,
+                    col_aliases=aliases,
+                )
+                for (_ep_id, row_start, row_stop) in episodes_meta
+            ]
+            self._merged_episode_ids = [ep_id for (ep_id, _s, _e) in episodes_meta]
+            # Bulk-prefetch per-episode language_instruction in one Lance `take`
+            # instead of N separate to_table() round-trips (one per episode).
+            # On a 88-episode dataset this saves ~250ms of cold-start time;
+            # scales linearly with episode count.
+            schema_names = {f.name for f in self._merged_ds.schema}
+            if "language_instruction" in schema_names:
+                start_rows = [v._row_offset for v in self._episodes]
+                try:
+                    instr_arr = (
+                        self._merged_ds.take(start_rows, columns=["language_instruction"])
+                        ["language_instruction"].to_pylist()
+                    )
+                    for view, instr in zip(self._episodes, instr_arr):
+                        view._instruction = str(instr or "")
+                except Exception as exc:
+                    logger.warning(
+                        "LanceDataset: bulk instruction prefetch failed (%s); "
+                        "falling back to lazy per-episode reads.", exc
+                    )
+            logger.info(
+                "LanceDataset: detected merged .lance under %s; %d episodes "
+                "(episode_index range [%d..%d])",
+                self._root,
+                len(self._episodes),
+                self._merged_episode_ids[0],
+                self._merged_episode_ids[-1],
             )
-        logger.info("LanceDataset: discovered %d episode(s) under %s", len(episode_paths), self._root)
+        else:
+            episode_paths = discover_lance_episodes(self._root)
+            if not episode_paths:
+                raise FileNotFoundError(
+                    f"No .lance episodes discovered under {self._root}. "
+                    "Pass either a single foo.lance directory or a directory containing episode_*.lance."
+                )
+            logger.info(
+                "LanceDataset: discovered %d raw per-episode .lance file(s) under %s",
+                len(episode_paths),
+                self._root,
+            )
+            self._episodes = [_EpisodeLance.from_path(p) for p in episode_paths]
+            self._merged_episode_ids = None
 
-        self._episodes: list[_EpisodeLance] = [_EpisodeLance(p) for p in episode_paths]
-
-        # Per-episode row ranges (global index).
+        # Per-episode row ranges (global index — Scribe-internal numbering,
+        # 0..N-1 across all episodes regardless of source).
         lengths = [ep.row_count for ep in self._episodes]
         starts = np.concatenate(([0], np.cumsum(lengths)[:-1])).astype(np.int64)
         stops = np.cumsum(lengths).astype(np.int64)
@@ -467,7 +741,42 @@ class LanceDataset:
         probe = self._episodes[0]
         self._cameras: list[str] = probe.cameras
         if not self._cameras:
-            raise RuntimeError(f"{episode_paths[0]}: no recognized camera columns (mid/left/right)")
+            raise RuntimeError(
+                f"{self._root}: no recognized camera columns; expected `<cam>_frame_id` "
+                "for at least one of mid/left/right."
+            )
+
+        # Schema validator: required logical columns must be present so that
+        # `_read_global_range` can fill state/action without silently zeroing.
+        # In merged mode this checks aliased names too (via non_blob_columns).
+        avail_logical = set(probe.non_blob_columns)
+        missing_logical = [c for c in _REQUIRED_LOGICAL_SCALAR_COLS if c not in avail_logical]
+        if missing_logical:
+            raise RuntimeError(
+                f"{self._root}: required column(s) {missing_logical} missing from "
+                f"schema (logical names). This dataset cannot drive the visualizer; "
+                f"the previous behavior of silently filling zeros has been removed."
+            )
+        # Per-camera GOP companion columns must also be present, otherwise
+        # video timeline alignment would silently fall back to per-row position.
+        # Fail at construction time — better than crashing in `_gop_layout` on
+        # the first user click.
+        missing_video_cols: list[str] = []
+        for cam in self._cameras:
+            for col in (f"{cam}_gop_index", f"{cam}_frame_index_in_gop"):
+                if col not in avail_logical:
+                    missing_video_cols.append(col)
+        if missing_video_cols:
+            raise RuntimeError(
+                f"{self._root}: required video companion column(s) {missing_video_cols} "
+                f"missing for cameras {self._cameras}. Cannot drive video timeline."
+            )
+
+        # Merged datasets are pre-downsampled to camera fps; reading robot_fps()
+        # from timestamps would give the camera rate (e.g. 30 Hz) anyway since
+        # merged rows are anchor-frame-aligned. For raw per-episode (100 Hz),
+        # robot_fps() gives ~100. Either way, the frontend uses this as "robot
+        # signal sample rate", which matches the row rate of this dataset.
         self._fps = float(round(probe.robot_fps(), 3))
         first_cam = self._cameras[0]
         self._cam_fps = float(round(probe.camera_fps(first_cam), 3))
