@@ -168,7 +168,10 @@ def _build_annotation_response_context(
         normalized_instruction = str(language_instruction or "")
 
     task_name, task_profile = resolve_task_profile(task_store, normalized_instruction)
-    return build_task_context_payload(annotation_context, task_name, task_profile, scheme=DEFAULT_SCHEME)
+    return build_task_context_payload(
+        annotation_context, task_name, task_profile, scheme=DEFAULT_SCHEME,
+        event_types=task_store.get("event_types") or [],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +769,9 @@ def run_server(
         stage_catalog = build_task_context_payload(annotation_context, task_name, task_profile, scheme=scheme)[
             "stage_catalog"
         ]
-        stage_order = list(get_scheme_config(task_profile, scheme=scheme).get("stage_order", []))
+        scheme_config = get_scheme_config(task_profile, scheme=scheme)
+        stage_order = list(scheme_config.get("stage_order", []))
+        stage_order_strict = bool(scheme_config.get("stage_order_strict", True))
         allow_custom_labels = bool(task_profile.get("allow_custom_labels", True))
 
         raw_stage_label = str(payload.get("stage_label") or "").strip()
@@ -808,6 +813,14 @@ def run_server(
             str(request.headers.get("X-Operator") or payload.get("operator") or "anonymous").strip() or "anonymous"
         )
         segment_id = str(payload.get("segment_id") or new_annotation_id("segment"))
+
+        outcome_raw = payload.get("outcome")
+        outcome = str(outcome_raw).strip() if isinstance(outcome_raw, str) and outcome_raw.strip() else None
+        if outcome is not None:
+            allowed_outcomes = {o.get("id") for o in (task_profile.get("outcomes") or []) if o.get("id")}
+            if allowed_outcomes and outcome not in allowed_outcomes:
+                return jsonify({"error": f"outcome must be one of: {', '.join(sorted(allowed_outcomes))}"}), 400
+
         segment_record = normalize_segment(
             {
                 "segment_id": segment_id,
@@ -815,6 +828,7 @@ def run_server(
                 "scheme": scheme,
                 "stage_label": raw_stage_label,
                 "display_label": display_label,
+                "color": color,
                 "frame_start": frame_start,
                 "frame_end": frame_end,
                 "time_start_s": time_start_s,
@@ -822,9 +836,9 @@ def run_server(
                 "operator": operator,
                 "updated_at": utc_now_iso(),
                 "is_custom_label": is_custom_label,
+                "outcome": outcome,
             }
         )
-        segment_record["color"] = color
 
         storage_path = Path(annotation_context["files"]["segment_annotations"])
         with _segment_annotation_lock:
@@ -849,7 +863,36 @@ def run_server(
                 if str(existing.get("segment_id") or "") != segment_id
             ]
             candidate_segments = existing_segments + [segment_record]
-            summary = summarize_episode_segments(candidate_segments, stage_order=stage_order, total_frames=frame_count)
+
+            # Containment: flatten_internal segment must fall inside a parent_scheme[parent_stage] segment.
+            parent_scheme_name = scheme_config.get("parent_scheme")
+            parent_stage_label = scheme_config.get("parent_stage")
+            if parent_scheme_name and parent_stage_label:
+                parent_segments = [
+                    normalize_segment(s)
+                    for s in record.get("schemes", {}).get(parent_scheme_name, [])
+                    if str(s.get("stage_label") or "") == parent_stage_label
+                ]
+                contained = any(
+                    int(p["frame_start"]) <= frame_start and frame_end <= int(p["frame_end"])
+                    for p in parent_segments
+                )
+                if not contained:
+                    return jsonify(
+                        {
+                            "error": (
+                                f"{scheme} segment must be fully contained within a "
+                                f"{parent_scheme_name}/{parent_stage_label} segment first"
+                            )
+                        }
+                    ), 400
+
+            summary = summarize_episode_segments(
+                candidate_segments,
+                stage_order=stage_order,
+                total_frames=frame_count,
+                stage_order_strict=stage_order_strict,
+            )
             blocking_errors = [
                 error
                 for error in summary["errors"]
@@ -872,6 +915,7 @@ def run_server(
             episode_record.get("schemes", {}).get(scheme, []),
             stage_order=stage_order,
             total_frames=frame_count,
+            stage_order_strict=stage_order_strict,
         )
         summary["task_name"] = task_name
 
@@ -907,38 +951,45 @@ def run_server(
             deleted_record = None
             deleted_episode_index = None
             deleted_task_name = None
+            deleted_scheme = None
             for episode_key, episode_record in list(store["items"].items()):
                 schemes = episode_record.get("schemes", {})
-                current_segments = schemes.get(DEFAULT_SCHEME, [])
-                remaining_segments = []
-                for segment in current_segments:
-                    if str(segment.get("segment_id") or "") == segment_id:
-                        deleted_record = normalize_segment(segment)
-                        deleted_episode_index = int(episode_record.get("episode_index", episode_key))
-                        deleted_task_name = str(episode_record.get("task_name") or "")
+                for scheme_name in list(schemes.keys()):
+                    current_segments = schemes.get(scheme_name, [])
+                    remaining_segments = []
+                    found_in_scheme = False
+                    for segment in current_segments:
+                        if str(segment.get("segment_id") or "") == segment_id:
+                            deleted_record = normalize_segment(segment)
+                            deleted_episode_index = int(episode_record.get("episode_index", episode_key))
+                            deleted_task_name = str(episode_record.get("task_name") or "")
+                            deleted_scheme = scheme_name
+                            found_in_scheme = True
+                            continue
+                        remaining_segments.append(normalize_segment(segment))
+
+                    if not found_in_scheme:
                         continue
-                    remaining_segments.append(normalize_segment(segment))
 
-                if deleted_record is None:
-                    continue
-
-                if remaining_segments:
-                    episode_record["schemes"][DEFAULT_SCHEME] = remaining_segments
+                    if remaining_segments:
+                        episode_record["schemes"][scheme_name] = remaining_segments
+                    else:
+                        episode_record["schemes"].pop(scheme_name, None)
                     episode_record["updated_at"] = utc_now_iso()
-                else:
-                    episode_record.get("schemes", {}).pop(DEFAULT_SCHEME, None)
                     if not episode_record.get("schemes"):
                         store["items"].pop(episode_key, None)
-                    else:
-                        episode_record["updated_at"] = utc_now_iso()
-                save_segment_annotation_store(storage_path, store)
-                break
+                    save_segment_annotation_store(storage_path, store)
+                    break
+
+                if deleted_record is not None:
+                    break
 
         if deleted_record is None or deleted_episode_index is None:
             return jsonify({"error": f"segment_id not found: {segment_id}"}), 404
 
+        summary_scheme = deleted_scheme or DEFAULT_SCHEME
         stage_order = list(
-            get_scheme_config(task_store.get("tasks", {}).get(deleted_task_name, {}), DEFAULT_SCHEME).get(
+            get_scheme_config(task_store.get("tasks", {}).get(deleted_task_name, {}), summary_scheme).get(
                 "stage_order", []
             )
         )
@@ -948,15 +999,16 @@ def run_server(
                 "episode_index": deleted_episode_index,
                 "task_name": deleted_task_name,
                 "updated_at": utc_now_iso(),
-                "schemes": {DEFAULT_SCHEME: []},
+                "schemes": {summary_scheme: []},
             },
         )
         summary = summarize_episode_segments(
-            remaining_record.get("schemes", {}).get(DEFAULT_SCHEME, []),
+            remaining_record.get("schemes", {}).get(summary_scheme, []),
             stage_order=stage_order,
             total_frames=get_episode_frame_count(resolved_dataset, deleted_episode_index),
         )
         summary["task_name"] = deleted_task_name
+        summary["scheme"] = summary_scheme
 
         return jsonify(
             {
@@ -1030,6 +1082,12 @@ def run_server(
         event_type = str(payload.get("event_type") or "").strip()
         if not event_type:
             return jsonify({"error": "event_type is required"}), 400
+
+        allowed_event_ids = {e.get("id") for e in (task_store.get("event_types") or []) if e.get("id")}
+        if allowed_event_ids and event_type not in allowed_event_ids:
+            return jsonify(
+                {"error": f"event_type must be one of: {', '.join(sorted(allowed_event_ids))}"}
+            ), 400
 
         task_name = str(payload.get("task_name") or "").strip()
         if task_name and task_name not in task_store.get("tasks", {}):

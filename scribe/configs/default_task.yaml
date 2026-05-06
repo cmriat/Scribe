@@ -1,0 +1,73 @@
+# Default task annotation config for Scribe.
+#
+# Loader precedence (annotation_store.load_task_annotation_store):
+#   1. <dataset_root>/annotations/task_annotation_config.yaml   (per-dataset override)
+#   2. <dataset_root>/annotations/task_annotation_config.json   (runtime mutations from frontend)
+#   3. this file (scribe/configs/default_task.yaml)             (builtin baseline)
+#   4. DEFAULT_TASK_ANNOTATION_STORE in annotation_store.py     (last-resort dict)
+#
+# YAML field reference:
+#   event_types[]              global frame-event whitelist (id, title, color)
+#   tasks.<id>:
+#     display_name             user-facing
+#     match_keywords           auto-resolve task by language_instruction substring match
+#     allow_custom_labels      reject non-listed stage_label when false
+#     outcomes[]               valid `outcome` values for segments in this task
+#     schemes.<scheme>:
+#       display_name
+#       stage_order_strict     primary=false (allow flatten_for_folding repeat),
+#                              flatten_internal=false (weak order)
+#       stage_order            ordered list of stage_label
+#       stage_metadata.<id>    {title, color}
+#       parent_scheme          (flatten_internal only) which scheme owns containment
+#       parent_stage           (flatten_internal only) stage_label inside parent
+
+version: 1
+active_task_name: fold_long_horizon
+
+event_types:
+  - { id: regrasp,            title: 重新抓取,          color: "#dc2626" }
+  - { id: slip,               title: 滑脱,              color: "#f97316" }
+  - { id: missed_grasp,       title: 未抓住,            color: "#eab308" }
+  - { id: orientation_adjust, title: 调整方向,          color: "#84cc16" }
+  - { id: minor_adjust,       title: 一般性小调整,      color: "#06b6d4" }
+  - { id: partial_unfold,     title: 局部重新展开,      color: "#a855f7" }
+
+tasks:
+  flatten_fold_tshirt:
+    display_name: 展平状态-叠衣服
+    match_keywords: [shirt, laid flat]
+    allow_custom_labels: false
+    outcomes:
+      - { id: completed,             title: 完成 }
+      - { id: not_completed_continue, title: "未完成，继续" }
+      - { id: aborted_or_restart,    title: "中止/重启" }
+    schemes:
+      primary:
+        display_name: 高层语义阶段
+        stage_order_strict: false
+        stage_order:
+          - prepare_on_table
+          - flatten_for_folding
+          - fold_near_sleeve
+          - fold_far_sleeve
+          - fold_body_half
+          - fold_body_compact
+          - place_folded_garment
+        stage_metadata:
+          prepare_on_table:     { title: 从盒子抓取放到桌面准备整理, color: "#0ea5e9" }
+          flatten_for_folding:  { title: 展平到可折叠状态, color: "#10b981" }
+          fold_near_sleeve:     { title: 折叠近侧衣袖,     color: "#3b82f6" }
+          fold_far_sleeve:      { title: 折叠远侧衣袖,     color: "#6366f1" }
+          fold_body_half:       { title: 整体第一次对折,   color: "#8b5cf6" }
+          fold_body_compact:    { title: 整体第二次对折,   color: "#a855f7" }
+          place_folded_garment: { title: 放到目标位置,     color: "#22c55e" }
+      flatten_internal:
+        display_name: 展平内部操作
+        parent_scheme: primary
+        parent_stage: flatten_for_folding
+        stage_order_strict: false
+        stage_order: [coarse_adjust, local_refine]
+        stage_metadata:
+          coarse_adjust: { title: 粗粒度调整, color: "#f59e0b" }
+          local_refine:  { title: 局部微调,   color: "#ec4899" }

@@ -2,22 +2,30 @@ from __future__ import annotations
 
 import re
 import json
+import logging
 from copy import deepcopy
 from uuid import uuid4
 from typing import Any
 from pathlib import Path
 from datetime import datetime, timezone
 
+import yaml
+
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+logger = logging.getLogger(__name__)
 
 ANNOTATIONS_DIRNAME = "annotations"
 EPISODE_CURATION_FILENAME = "episode_curation.json"
 SEGMENT_ANNOTATIONS_FILENAME = "segment_annotations.json"
 FRAME_EVENTS_FILENAME = "frame_events.jsonl"
 TASK_ANNOTATION_CONFIG_FILENAME = "task_annotation_config.json"
+TASK_ANNOTATION_CONFIG_YAML_FILENAME = "task_annotation_config.yaml"
+BUILTIN_TASK_YAML_PATH = Path(__file__).parent / "configs" / "default_task.yaml"
 
-DEFAULT_SCHEME = "sparse"
-SUPPORTED_SCHEMES = {DEFAULT_SCHEME}
+DEFAULT_SCHEME = "primary"
+SUPPORTED_SCHEMES = {"primary", "flatten_internal"}
+SUPPORTED_OUTCOMES = {"completed", "not_completed_continue", "aborted_or_restart"}
 
 
 def utc_now_iso() -> str:
@@ -30,48 +38,59 @@ def new_annotation_id(prefix: str) -> str:
 
 DEFAULT_TASK_ANNOTATION_STORE = {
     "version": 1,
-    "active_task_name": None,
+    "active_task_name": "fold_long_horizon",
+    "event_types": [
+        {"id": "regrasp", "title": "重新抓取", "color": "#dc2626"},
+        {"id": "slip", "title": "滑脱", "color": "#f97316"},
+        {"id": "missed_grasp", "title": "未抓住", "color": "#eab308"},
+        {"id": "orientation_adjust", "title": "调整方向", "color": "#84cc16"},
+        {"id": "minor_adjust", "title": "一般性小调整", "color": "#06b6d4"},
+        {"id": "partial_unfold", "title": "局部重新展开", "color": "#a855f7"},
+    ],
     "tasks": {
         "fold_long_horizon": {
-            "display_name": "Fold Cloth",
-            "match_keywords": [
-                "fold",
-                "laundry",
-                "shirt",
-                "t-shirt",
-                "cloth",
-                "garment",
-                "sleeve",
+            "display_name": "叠衣服",
+            "match_keywords": ["fold", "laundry", "shirt", "t-shirt", "cloth", "garment", "sleeve"],
+            "allow_custom_labels": False,
+            "outcomes": [
+                {"id": "completed", "title": "完成"},
+                {"id": "not_completed_continue", "title": "未完成，继续"},
+                {"id": "aborted_or_restart", "title": "中止/重启"},
             ],
-            "allow_custom_labels": True,
             "schemes": {
-                "sparse": {
-                    "display_name": "Sparse",
-                    "stage_order": ["pick_up", "spread", "fold", "place"],
+                "primary": {
+                    "display_name": "高层语义阶段",
+                    "stage_order_strict": False,
+                    "stage_order": [
+                        "prepare_on_table",
+                        "flatten_for_folding",
+                        "fold_near_sleeve",
+                        "fold_far_sleeve",
+                        "fold_body_half",
+                        "fold_body_compact",
+                        "place_folded_garment",
+                    ],
                     "stage_metadata": {
-                        "pick_up": {"title": "Pick Up", "color": "#0f766e"},
-                        "spread": {"title": "Spread", "color": "#2563eb"},
-                        "fold": {"title": "Fold", "color": "#9333ea"},
-                        "place": {"title": "Place", "color": "#ea580c"},
+                        "prepare_on_table":     {"title": "放到桌面准备整理", "color": "#0ea5e9"},
+                        "flatten_for_folding":  {"title": "展平到可折叠状态", "color": "#10b981"},
+                        "fold_near_sleeve":     {"title": "折叠近侧衣袖",     "color": "#3b82f6"},
+                        "fold_far_sleeve":      {"title": "折叠远侧衣袖",     "color": "#6366f1"},
+                        "fold_body_half":       {"title": "整体第一次对折",   "color": "#8b5cf6"},
+                        "fold_body_compact":    {"title": "整体第二次对折",   "color": "#a855f7"},
+                        "place_folded_garment": {"title": "放到目标位置",     "color": "#22c55e"},
                     },
-                }
-            },
-        },
-        "generic_long_horizon": {
-            "display_name": "Generic Long Horizon",
-            "match_keywords": [],
-            "allow_custom_labels": True,
-            "schemes": {
-                "sparse": {
-                    "display_name": "Sparse",
-                    "stage_order": ["acquire", "arrange", "operate", "place"],
+                },
+                "flatten_internal": {
+                    "display_name": "展平内部操作",
+                    "parent_scheme": "primary",
+                    "parent_stage": "flatten_for_folding",
+                    "stage_order_strict": False,
+                    "stage_order": ["coarse_adjust", "local_refine"],
                     "stage_metadata": {
-                        "acquire": {"title": "Acquire", "color": "#0f766e"},
-                        "arrange": {"title": "Arrange", "color": "#2563eb"},
-                        "operate": {"title": "Operate", "color": "#9333ea"},
-                        "place": {"title": "Place", "color": "#ea580c"},
+                        "coarse_adjust": {"title": "粗粒度调整", "color": "#f59e0b"},
+                        "local_refine":  {"title": "局部微调",   "color": "#ec4899"},
                     },
-                }
+                },
             },
         },
     },
@@ -161,24 +180,57 @@ def save_episode_curation_store(storage_path: Path, store: dict[str, Any]) -> No
     storage_path.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _read_yaml_task_config(path: Path) -> dict[str, Any] | None:
+    """Read a YAML task-config file. Returns None on missing/invalid."""
+    try:
+        if not path.exists():
+            return None
+        content = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("failed to load task config YAML %s: %s", path, exc)
+        return None
+    return content if isinstance(content, dict) else None
+
+
+def _builtin_task_annotation_store() -> dict[str, Any]:
+    """Builtin baseline: scribe/configs/default_task.yaml, fallback to Python dict."""
+    yaml_content = _read_yaml_task_config(BUILTIN_TASK_YAML_PATH)
+    if yaml_content and isinstance(yaml_content.get("tasks"), dict) and yaml_content["tasks"]:
+        return deepcopy(yaml_content)
+    return deepcopy(DEFAULT_TASK_ANNOTATION_STORE)
+
+
 def default_task_annotation_store(dataset_id: str) -> dict[str, Any]:
-    store = deepcopy(DEFAULT_TASK_ANNOTATION_STORE)
+    store = _builtin_task_annotation_store()
     store["dataset_id"] = dataset_id
     store["updated_at"] = utc_now_iso()
     return store
 
 
 def load_task_annotation_store(storage_path: Path, dataset_id: str) -> dict[str, Any]:
+    """Three-tier resolution:
+       1. <annotations_dir>/task_annotation_config.yaml  (per-dataset override; preferred)
+       2. <annotations_dir>/task_annotation_config.json  (runtime mutations from frontend)
+       3. builtin (scribe/configs/default_task.yaml -> DEFAULT_TASK_ANNOTATION_STORE)
+    """
     default_store = default_task_annotation_store(dataset_id)
-    if not storage_path.exists():
-        return default_store
 
-    try:
-        content = json.loads(storage_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default_store
+    yaml_path = storage_path.with_name(TASK_ANNOTATION_CONFIG_YAML_FILENAME)
+    yaml_content = _read_yaml_task_config(yaml_path)
 
-    if not isinstance(content, dict):
+    json_content: dict[str, Any] | None = None
+    if storage_path.exists():
+        try:
+            parsed = json.loads(storage_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                json_content = parsed
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Prefer dataset YAML; fallback to JSON; fallback to builtin
+    content = yaml_content if (yaml_content and isinstance(yaml_content.get("tasks"), dict) and yaml_content["tasks"]) else json_content
+
+    if content is None:
         return default_store
 
     tasks = content.get("tasks", {})
@@ -188,21 +240,33 @@ def load_task_annotation_store(storage_path: Path, dataset_id: str) -> dict[str,
     active_task_name = content.get("active_task_name")
     if active_task_name is not None and not isinstance(active_task_name, str):
         active_task_name = None
+    if active_task_name is None:
+        active_task_name = default_store.get("active_task_name")
+
+    event_types = content.get("event_types")
+    if not isinstance(event_types, list) or not event_types:
+        event_types = default_store.get("event_types", [])
 
     return {
         "version": 1,
         "dataset_id": dataset_id,
         "updated_at": str(content.get("updated_at") or utc_now_iso()),
         "active_task_name": active_task_name,
+        "event_types": event_types,
         "tasks": tasks,
     }
 
 
 def ensure_task_annotation_store(storage_path: Path, dataset_id: str) -> dict[str, Any]:
-    store = load_task_annotation_store(storage_path, dataset_id)
-    if not storage_path.exists():
-        save_task_annotation_store(storage_path, store)
-    return store
+    """Resolve the task store via three-tier fallback.
+
+    Note: We do NOT auto-write JSON on first read. JSON is only written by
+    explicit runtime mutations (e.g. POST from frontend). This keeps the
+    builtin YAML (and per-dataset YAML override) as the live source of truth
+    so edits to scribe/configs/default_task.yaml take effect on next restart
+    without needing to delete a stale JSON snapshot.
+    """
+    return load_task_annotation_store(storage_path, dataset_id)
 
 
 def save_task_annotation_store(storage_path: Path, store: dict[str, Any]) -> None:
@@ -344,12 +408,15 @@ def save_frame_event_records(storage_path: Path, dataset_id: str, items: list[di
 
 
 def normalize_segment(segment: dict[str, Any]) -> dict[str, Any]:
+    raw_outcome = segment.get("outcome")
+    outcome = str(raw_outcome).strip() if isinstance(raw_outcome, str) and raw_outcome.strip() else None
     return {
         "segment_id": str(segment.get("segment_id") or new_annotation_id("segment")),
         "task_name": str(segment.get("task_name") or ""),
         "scheme": str(segment.get("scheme") or DEFAULT_SCHEME),
         "stage_label": str(segment.get("stage_label") or "").strip(),
         "display_label": str(segment.get("display_label") or segment.get("stage_label") or "").strip(),
+        "color": str(segment.get("color") or "").strip(),
         "frame_start": int(segment.get("frame_start", 0)),
         "frame_end": int(segment.get("frame_end", 0)),
         "time_start_s": float(segment.get("time_start_s", 0.0)),
@@ -357,6 +424,7 @@ def normalize_segment(segment: dict[str, Any]) -> dict[str, Any]:
         "operator": str(segment.get("operator") or "anonymous").strip() or "anonymous",
         "updated_at": str(segment.get("updated_at") or utc_now_iso()),
         "is_custom_label": bool(segment.get("is_custom_label", False)),
+        "outcome": outcome,
     }
 
 
@@ -443,6 +511,8 @@ def build_task_context_payload(
     task_name: str,
     task_profile: dict[str, Any],
     scheme: str = DEFAULT_SCHEME,
+    *,
+    event_types: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     scheme_config = get_scheme_config(task_profile, scheme=scheme)
     files = annotation_context.get("files", {})
@@ -455,7 +525,10 @@ def build_task_context_payload(
         "scheme": scheme,
         "allow_custom_labels": bool(task_profile.get("allow_custom_labels", True)),
         "stage_order": list(scheme_config.get("stage_order", [])),
+        "stage_order_strict": bool(scheme_config.get("stage_order_strict", True)),
         "stage_catalog": build_stage_catalog(task_profile, scheme=scheme),
+        "outcomes": list(task_profile.get("outcomes") or []),
+        "event_types": list(event_types or []),
         "files": {
             "task_config": files.get("task_config"),
             "segment_annotations": files.get("segment_annotations"),
@@ -468,6 +541,7 @@ def summarize_episode_segments(
     segments: list[dict[str, Any]],
     stage_order: list[str],
     total_frames: int,
+    stage_order_strict: bool = True,
 ) -> dict[str, Any]:
     sorted_segments = sort_segments([normalize_segment(segment) for segment in segments if isinstance(segment, dict)])
     if not sorted_segments:
@@ -507,16 +581,21 @@ def summarize_episode_segments(
             continue
 
         stage_index = stage_order.index(stage_label)
-        if stage_label in seen_stage_labels:
-            errors.append(f"duplicate_stage:{stage_label}")
+        if stage_order_strict:
+            if stage_label in seen_stage_labels:
+                errors.append(f"duplicate_stage:{stage_label}")
+            if previous_stage_index is not None and stage_index <= previous_stage_index:
+                errors.append(f"order:{stage_label}")
         seen_stage_labels.add(stage_label)
         stage_indices.append(stage_index)
-        if previous_stage_index is not None and stage_index <= previous_stage_index:
-            errors.append(f"order:{stage_label}")
         previous_stage_index = stage_index
 
     total_frames = max(int(total_frames), 0)
-    expected_complete = stage_indices == list(range(len(stage_order))) if stage_order else False
+    if stage_order_strict:
+        expected_complete = stage_indices == list(range(len(stage_order))) if stage_order else False
+    else:
+        # Weak-order schemes are not auto-exportable; require explicit pipeline review.
+        expected_complete = False
     starts_at_zero = int(sorted_segments[0].get("frame_start", 0)) == 0
     ends_at_last = total_frames > 0 and int(sorted_segments[-1].get("frame_end", -1)) >= total_frames - 1
     coverage_ratio = 0.0 if total_frames <= 0 else min(1.0, covered_frames / max(total_frames, 1))
@@ -545,7 +624,9 @@ def build_segment_summary_by_episode(
     stage_order_by_task: dict[str, list[str]],
     frame_counts_by_episode: dict[int, int],
     scheme: str = DEFAULT_SCHEME,
+    stage_order_strict_by_task: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
+    strict_by_task = stage_order_strict_by_task or {}
     summary: dict[str, Any] = {}
     for episode_key, record in store.get("items", {}).items():
         task_name = str(record.get("task_name") or "")
@@ -556,6 +637,7 @@ def build_segment_summary_by_episode(
             segments,
             stage_order=stage_order,
             total_frames=frame_counts_by_episode.get(episode_index, 0),
+            stage_order_strict=strict_by_task.get(task_name, True),
         )
         episode_summary["task_name"] = task_name
         summary[str(episode_index)] = episode_summary
@@ -582,9 +664,11 @@ def build_custom_task_profile(task_name: str) -> dict[str, Any]:
         "display_name": task_name or slug.replace("_", " ").title(),
         "match_keywords": [],
         "allow_custom_labels": True,
+        "outcomes": [],
         "schemes": {
-            "sparse": {
-                "display_name": "Sparse",
+            "primary": {
+                "display_name": "Primary",
+                "stage_order_strict": False,
                 "stage_order": [],
                 "stage_metadata": {},
             }

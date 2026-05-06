@@ -204,7 +204,7 @@
                         <p class="mt-1 text-zinc-300">
                             <span x-text="annotationContext.task_display_name || 'Task'"></span>
                             <span class="text-zinc-500"> · </span>
-                            <span x-text="annotationContext.scheme || 'sparse'"></span>
+                            <span x-text="annotationContext.scheme || 'primary'"></span>
                         </p>
                         <p class="mt-1 text-zinc-400" x-text="`Complete: ${annotationCompleteCount} · Partial: ${annotationPartialCount}`"></p>
                         <p class="mt-1 text-zinc-400" x-text="`Current: ${annotationBadgeText(currentEpisodeId)}`"></p>
@@ -618,6 +618,18 @@
                                         class="annotation-panel-input min-w-[180px] px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-200"
                                     />
                                 </div>
+                                <div class="mt-2 flex flex-wrap items-center gap-2" x-show="availableOutcomes.length > 0">
+                                    <span class="text-[11px] text-zinc-500">Outcome:</span>
+                                    <select
+                                        x-model="annotationDraft.selectedOutcome"
+                                        class="annotation-panel-input min-w-[160px] px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-200"
+                                    >
+                                        <option value="">（不设置）</option>
+                                        <template x-for="oc in availableOutcomes" :key="oc.id">
+                                            <option :value="oc.id" x-text="`${oc.title} (${oc.id})`"></option>
+                                        </template>
+                                    </select>
+                                </div>
                                 <div class="mt-2 flex flex-wrap gap-2">
                                     <button @click="setDraftBoundary('start')" class="annotation-panel-input px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800">Set Start</button>
                                     <button @click="setDraftBoundary('end')" class="annotation-panel-input px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800">Set End</button>
@@ -648,8 +660,9 @@
                                         x-model="frameEventDraft.event_type"
                                         class="annotation-panel-input min-w-[170px] px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-200"
                                     >
-                                        <template x-for="eventType in frameEventTypes" :key="eventType">
-                                            <option :value="eventType" x-text="eventType"></option>
+                                        <option value="" disabled>选择事件类型...</option>
+                                        <template x-for="eventType in frameEventTypes" :key="eventType.id">
+                                            <option :value="eventType.id" x-text="`${eventType.title} (${eventType.id})`"></option>
                                         </template>
                                     </select>
                                     <input
@@ -671,7 +684,7 @@
                                     <template x-for="eventRecord in currentEpisodeEvents" :key="eventRecord.event_id">
                                         <div class="annotation-panel-list-item flex items-start justify-between gap-2 px-3 py-2 border-b border-zinc-800 last:border-b-0">
                                             <div class="min-w-0">
-                                                <p class="font-semibold text-zinc-200" x-text="eventRecord.event_type"></p>
+                                                <p class="font-semibold text-zinc-200" x-text="eventTypeLabel(eventRecord.event_type)"></p>
                                                 <p class="text-[11px] text-zinc-400" x-text="`#${eventRecord.frame_index} · ${formatFixed(eventRecord.time_s, 2)}s`"></p>
                                                 <p class="text-[11px] text-zinc-500 break-all" x-text="eventRecord.note || ''"></p>
                                             </div>
@@ -1290,7 +1303,7 @@
                 curationFilter: 'all',
                 curationSavingEpisodeId: null,
                 curationExporting: false,
-                annotationContext: window.__ANNOTATION_CONTEXT__ || { enabled: false, stage_catalog: [], stage_order: [], scheme: 'sparse' },
+                annotationContext: window.__ANNOTATION_CONTEXT__ || { enabled: false, stage_catalog: [], stage_order: [], scheme: 'primary', event_types: [], outcomes: [] },
                 annotationItems: {},
                 annotationSummaryByEpisode: {},
                 annotationPanelExpanded: true,
@@ -1305,21 +1318,15 @@
                     selectedStage: '',
                     useCustomLabel: false,
                     customStageLabel: '',
+                    selectedOutcome: '',
                     frame_start: null,
                     frame_end: null,
                     time_start_s: null,
                     time_end_s: null,
                 },
                 frameEvents: [],
-                frameEventTypes: [
-                    'grasp_success',
-                    'collision',
-                    'failure_recovery_start',
-                    'failure_recovery_end',
-                    'stage_note',
-                ],
                 frameEventDraft: {
-                    event_type: 'grasp_success',
+                    event_type: '',
                     note: '',
                 },
                 frameEventSaving: false,
@@ -1635,7 +1642,7 @@
 
                 get currentEpisodeSegments() {
                     const record = this.annotationItems[String(this.currentEpisodeId)] || null;
-                    const scheme = this.annotationContext?.scheme || 'sparse';
+                    const scheme = this.annotationContext?.scheme || 'primary';
                     const segments = Array.isArray(record?.schemes?.[scheme]) ? record.schemes[scheme] : [];
                     return [...segments]
                         .sort((left, right) => Number(left.frame_start || 0) - Number(right.frame_start || 0))
@@ -1716,6 +1723,26 @@
                     return hit?.title || String(stageLabel || '').replaceAll('_', ' ');
                 },
 
+                // Frame-event types come from the backend YAML whitelist
+                // (annotation_context.event_types). Returns [{id,title,color}, ...].
+                get frameEventTypes() {
+                    return Array.isArray(this.annotationContext?.event_types)
+                        ? this.annotationContext.event_types
+                        : [];
+                },
+
+                eventTypeLabel(eventTypeId) {
+                    const hit = this.frameEventTypes.find((e) => e.id === eventTypeId);
+                    return hit ? `${hit.title} (${hit.id})` : String(eventTypeId || '');
+                },
+
+                // Outcome list comes from annotation_context.outcomes (per task).
+                get availableOutcomes() {
+                    return Array.isArray(this.annotationContext?.outcomes)
+                        ? this.annotationContext.outcomes
+                        : [];
+                },
+
                 segmentTooltip(segment) {
                     return `${segment.display_label || segment.stage_label} (#${segment.frame_start} → #${segment.frame_end})`;
                 },
@@ -1777,7 +1804,7 @@
                         this.annotationDraft.selectedStage = this.currentStageCatalog[0].key;
                     }
                     if (!this.frameEventDraft.event_type && this.frameEventTypes.length > 0) {
-                        this.frameEventDraft.event_type = this.frameEventTypes[0];
+                        this.frameEventDraft.event_type = this.frameEventTypes[0].id;
                     }
                 },
 
@@ -1788,6 +1815,7 @@
                         selectedStage: preservedStage,
                         useCustomLabel: false,
                         customStageLabel: '',
+                        selectedOutcome: '',
                         frame_start: null,
                         frame_end: null,
                         time_start_s: null,
@@ -1816,6 +1844,7 @@
                         selectedStage: stageExists ? segment.stage_label : (this.currentStageCatalog[0]?.key || ''),
                         useCustomLabel: Boolean(segment.is_custom_label || !stageExists),
                         customStageLabel: stageExists ? '' : (segment.display_label || segment.stage_label || ''),
+                        selectedOutcome: segment.outcome || '',
                         frame_start: Number(segment.frame_start),
                         frame_end: Number(segment.frame_end),
                         time_start_s: Number(segment.time_start_s),
@@ -1897,12 +1926,13 @@
                                 segment_id: this.annotationDraft.segment_id,
                                 episode_index: this.currentEpisodeId,
                                 task_name: this.annotationContext.task_name,
-                                scheme: this.annotationContext.scheme || 'sparse',
+                                scheme: this.annotationContext.scheme || 'primary',
                                 stage_label: stageLabel,
                                 display_label: displayLabel,
                                 frame_start: frameStart,
                                 frame_end: frameEnd,
                                 is_custom_label: isCustomLabel,
+                                outcome: this.annotationDraft.selectedOutcome || null,
                             }),
                         });
                         const payload = await response.json();
