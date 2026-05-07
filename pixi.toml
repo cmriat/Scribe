@@ -30,6 +30,9 @@ lerobot = "==0.3.3"
 # 数据处理依赖
 datasets = "*"
 huggingface-hub = "*"
+# pylance 5.0.0b2 wheel 的 Requires-Dist：自动拉 lance-namespace + 它的传递依赖
+# (lance-namespace-urllib3-client 等)，避免 build-pylance-wheel 用 --no-deps 时漏装。
+lance-namespace = ">=0.5.2"
 # CLI工具
 tyro = ">=0.9.28,<1"
 termcolor = "*"
