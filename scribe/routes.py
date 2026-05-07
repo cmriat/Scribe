@@ -138,6 +138,52 @@ def _build_curation_response_context(curation_context: dict) -> dict:
     }
 
 
+def _compute_action_source_track(dataset_obj, episode_id: int) -> dict | None:
+    """Resolve per-episode HIL `action_source` spans across both backends.
+
+    Returns ``None`` when the dataset has no `action_source` column (legacy
+    pre-HIL data); the frontend hides the track entirely in that case.
+
+    For Lance datasets we delegate to `LanceDataset.get_episode_action_source_track`
+    which reads only the one column (its own column-presence check is reliable —
+    no broad except needed). For LeRobotDataset we read the parquet via the
+    hf_dataset shim (only when the v2.1 export carried `action_source`,
+    which `training_lance_to_lerobot.py` does conditionally).
+    """
+    if isinstance(dataset_obj, LanceDataset):
+        return dataset_obj.get_episode_action_source_track(episode_id)
+
+    # LeRobotDataset path — feature presence is the explicit gate.
+    features = getattr(dataset_obj, "features", {}) or {}
+    if "action_source" not in features:
+        return None
+    # Narrow except: we only swallow the well-known shapes that mean
+    # "feature is declared but not actually readable" (stale info.json,
+    # column dropped after select_columns, etc.). Real bugs (IndexError,
+    # NotImplementedError, IO errors, etc.) propagate as a 500 so they're
+    # caught in development instead of silently disabling the track.
+    try:
+        index = dataset_obj.episode_data_index
+        ep_from = int(index["from"][episode_id])
+        ep_to = int(index["to"][episode_id])
+        rows = (
+            dataset_obj.hf_dataset
+            .select(range(ep_from, ep_to))
+            .select_columns(["action_source"])
+            .with_format("python")
+        )
+        values = [str(r["action_source"]) for r in rows]
+    except (KeyError, AttributeError) as e:
+        logging.warning(
+            "action_source declared in features but not readable for ep=%s: %s",
+            episode_id, e,
+        )
+        return None
+
+    from scribe.lance_backend import _aggregate_action_source_spans
+    return _aggregate_action_source_spans(values)
+
+
 def _build_annotation_response_context(
     dataset_obj: LeRobotDataset | IterableNamespace,
     repo_id: str,
@@ -423,6 +469,8 @@ def run_server(
                 )
             )
 
+        action_source_track = _compute_action_source_track(dataset_obj, episode_id)
+
         return {
             "episode_id": episode_id,
             "episodes": episodes_value,
@@ -435,6 +483,7 @@ def run_server(
             "language_instruction": language_instruction,
             "curation_context": _build_curation_response_context(curation_context),
             "annotation_context": annotation_context,
+            "action_source_track": action_source_track,
             "frame_count": frame_count,
         }
 
@@ -470,6 +519,7 @@ def run_server(
             vendor_assets=vendor_assets,
             curation_context=payload["curation_context"],
             annotation_context=payload["annotation_context"],
+            action_source_track=payload["action_source_track"],
         )
 
     @app.route("/<string:dataset_namespace>/<string:dataset_name>/episode_<int:episode_id>.json")

@@ -84,6 +84,20 @@
             pointer-events: none;
         }
 
+        /* HIL action_source track — flat color spans, no border/radius so the
+           run-length-encoded segments visually butt up against each other. */
+        .action-source-segment {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            border: 0;
+            border-radius: 0;
+            box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18);
+        }
+        .action-source-segment.mode-vla    { background: #06b6d4; }   /* cyan-500 */
+        .action-source-segment.mode-human  { background: #f59e0b; }   /* amber-500 */
+        .action-source-segment.mode-other  { background: #64748b; }   /* slate-500 */
+
         .light-mode .annotation-track {
             border-color: #cbd5e1;
             background:
@@ -578,6 +592,33 @@
                             </div>
                         </div>
 
+                        <template x-if="actionSourceTrack && currentEpisodeActionSourceSpans.length > 0">
+                            <div class="mt-2">
+                                <div class="flex items-center justify-between text-[11px] font-mono text-zinc-400 mb-1">
+                                    <span class="flex items-center gap-2">
+                                        <span>Action source</span>
+                                        <span
+                                            class="px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide leading-none"
+                                            :class="currentEpisodeActionSourceModeBadgeClass"
+                                            x-text="currentEpisodeActionSourceMode"
+                                        ></span>
+                                    </span>
+                                    <span x-text="currentEpisodeActionSourceSummary"></span>
+                                </div>
+                                <div x-ref="actionSourceTrack" class="annotation-track h-4 cursor-pointer" @click="seekFromAnnotationTrack($event, 'actionSourceTrack')">
+                                    <template x-for="span in currentEpisodeActionSourceSpans" :key="`asrc-${span.start}`">
+                                        <div
+                                            class="action-source-segment"
+                                            :class="actionSourceModeClass(span.mode)"
+                                            :style="actionSourceSegmentStyle(span)"
+                                            :title="actionSourceSegmentTooltip(span)"
+                                        ></div>
+                                    </template>
+                                    <div class="annotation-cursor" :style="annotationCursorStyle()"></div>
+                                </div>
+                            </div>
+                        </template>
+
                         <div class="mt-2">
                             <div class="flex items-center justify-between text-[11px] font-mono text-zinc-400 mb-1">
                                 <span>Clip preview</span>
@@ -821,6 +862,7 @@
         window.__DATASET_REPO_ID__ = {{ dataset_info.repo_id | tojson }};
         window.__CURATION_CONTEXT__ = {{ curation_context | tojson }};
         window.__ANNOTATION_CONTEXT__ = {{ annotation_context | tojson }};
+        window.__ACTION_SOURCE_TRACK__ = {{ action_source_track | tojson }};
     </script>
 
     <script type="module">
@@ -1304,6 +1346,7 @@
                 curationSavingEpisodeId: null,
                 curationExporting: false,
                 annotationContext: window.__ANNOTATION_CONTEXT__ || { enabled: false, stage_catalog: [], stage_order: [], scheme: 'primary', event_types: [], outcomes: [] },
+                actionSourceTrack: window.__ACTION_SOURCE_TRACK__ || null,
                 annotationItems: {},
                 annotationSummaryByEpisode: {},
                 annotationPanelExpanded: true,
@@ -1655,6 +1698,97 @@
 
                 get currentEpisodeClipSegments() {
                     return this.currentEpisodeSegments;
+                },
+
+                get currentEpisodeActionSourceSpans() {
+                    const spans = this.actionSourceTrack?.spans;
+                    return Array.isArray(spans) ? spans : [];
+                },
+
+                get currentEpisodeActionSourceSummary() {
+                    // Build a "VLA 78% · Human 22%" style label from the row counts.
+                    const summary = this.actionSourceTrack?.summary;
+                    if (!summary || typeof summary !== 'object') return '';
+                    const total = Object.values(summary).reduce((a, b) => a + Number(b || 0), 0);
+                    if (total <= 0) return '';
+                    // Sort VLA-class modes first, then HUMAN-class, then anything else.
+                    const sortKey = (mode) => {
+                        const m = String(mode || '').toLowerCase();
+                        if (m.includes('vla')) return 0;
+                        if (m.includes('human')) return 1;
+                        return 2;
+                    };
+                    const labelFor = (mode) => {
+                        const m = String(mode || '').toLowerCase();
+                        if (m.includes('vla')) return 'VLA';
+                        if (m.includes('human')) return 'Human';
+                        return mode;
+                    };
+                    return Object.keys(summary)
+                        .sort((a, b) => sortKey(a) - sortKey(b))
+                        .map((mode) => {
+                            const n = Number(summary[mode] || 0);
+                            return n > 0 ? `${labelFor(mode)} ${Math.round((n / total) * 100)}%` : null;
+                        })
+                        .filter(Boolean)
+                        .join(' · ');
+                },
+
+                actionSourceModeClass(mode) {
+                    // Accept both `VLA_MODE`/`HUMAN_MODE` (current HIL controller enum names)
+                    // and short `vla`/`human` (likely future normalization). Case-insensitive
+                    // contains-match keeps unknown values landing on `mode-other`.
+                    const m = String(mode || '').toLowerCase();
+                    if (m.includes('vla')) return 'mode-vla';
+                    if (m.includes('human')) return 'mode-human';
+                    return 'mode-other';
+                },
+
+                actionSourceShortLabel(mode) {
+                    // User-facing label for the inline current-frame badge.
+                    // VLA_MODE / vla → MODEL ; HUMAN_MODE / human → HUMAN ; else raw.
+                    const m = String(mode || '').toLowerCase();
+                    if (m.includes('vla')) return 'MODEL';
+                    if (m.includes('human')) return 'HUMAN';
+                    return String(mode || '').toUpperCase();
+                },
+
+                get currentEpisodeActionSourceMode() {
+                    // Reactive: depends on currentFrameIndex + the span list, so the
+                    // badge updates as the video plays / user seeks.
+                    const spans = this.currentEpisodeActionSourceSpans;
+                    if (!spans.length) return '';
+                    const idx = this.currentFrameIndex;
+                    if (!Number.isFinite(idx)) return '';
+                    // Linear scan — typical episode has <100 spans even with heavy alternation.
+                    for (const span of spans) {
+                        if (idx >= span.start && idx <= span.end) {
+                            return this.actionSourceShortLabel(span.mode);
+                        }
+                    }
+                    // Fallback: idx past last span (rare cursor-at-end edge case).
+                    return this.actionSourceShortLabel(spans[spans.length - 1].mode);
+                },
+
+                get currentEpisodeActionSourceModeBadgeClass() {
+                    // Match the track segment colors so the badge visually identifies the mode.
+                    const label = this.currentEpisodeActionSourceMode;
+                    if (label === 'MODEL') return 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40';
+                    if (label === 'HUMAN') return 'bg-amber-500/20 text-amber-300 border-amber-500/40';
+                    return 'bg-slate-500/20 text-slate-300 border-slate-500/40';
+                },
+
+                actionSourceSegmentStyle(span) {
+                    const total = Math.max(1, this.currentEpisodeFrameCount);
+                    const start = (Number(span.start || 0) / total) * 100;
+                    const width = ((Number(span.end || 0) - Number(span.start || 0) + 1) / total) * 100;
+                    return `left:${start}%; width:${width}%;`;
+                },
+
+                actionSourceSegmentTooltip(span) {
+                    const fps = Number(window.__DATASET_FPS__) || 30;
+                    const dur = ((Number(span.end || 0) - Number(span.start || 0) + 1) / fps).toFixed(2);
+                    return `${span.mode} · frames ${span.start}–${span.end} · ${dur}s`;
                 },
 
                 get currentEpisodeEvents() {
@@ -2157,6 +2291,7 @@
                     if (payload?.annotation_context) {
                         this.annotationContext = payload.annotation_context;
                     }
+                    this.actionSourceTrack = payload?.action_source_track || null;
                     this.currentEpisodeFrameCount = Number(payload?.frame_count || 0);
                     this.ensureAnnotationDraftDefaults();
                     this.resetAnnotationDraft();

@@ -171,6 +171,31 @@ def _is_merged_lance(ds: lance.LanceDataset) -> bool:
     return LANCE_MERGED_SIGNATURE_COLS <= {f.name for f in ds.schema}
 
 
+def _aggregate_action_source_spans(values: list[str]) -> dict:
+    """Compress a per-row list of action_source labels into contiguous spans.
+
+    Used by HIL viz: the `action_source` column flips between values like
+    ``"VLA_MODE"`` / ``"HUMAN_MODE"`` over an episode; the timeline track
+    only needs the run-length-encoded view (typically <100 spans / episode
+    even for heavily-alternating data). Returns ``{"spans": [...], "summary": {...}}``.
+    """
+    if not values:
+        return {"spans": [], "summary": {}}
+    spans: list[dict] = []
+    summary: dict[str, int] = {}
+    cur_mode = values[0]
+    cur_start = 0
+    for i in range(1, len(values)):
+        if values[i] != cur_mode:
+            spans.append({"start": cur_start, "end": i - 1, "mode": cur_mode})
+            summary[cur_mode] = summary.get(cur_mode, 0) + (i - cur_start)
+            cur_mode = values[i]
+            cur_start = i
+    spans.append({"start": cur_start, "end": len(values) - 1, "mode": cur_mode})
+    summary[cur_mode] = summary.get(cur_mode, 0) + (len(values) - cur_start)
+    return {"spans": spans, "summary": summary}
+
+
 def _split_episodes_by_index(ds: lance.LanceDataset) -> list[tuple[int, int, int]]:
     """Group rows by the `episode_index` column, return [(ep_id, row_start, row_stop)] sorted by ep_id.
 
@@ -847,6 +872,25 @@ class LanceDataset:
                 "video_frame_indices": frame_indices.tolist(),
             }
         return out
+
+    def get_episode_action_source_track(self, episode_index: int) -> dict | None:
+        """Return per-row HIL `action_source` aggregated into contiguous spans.
+
+        Format: ``{"spans": [{"start": int, "end": int, "mode": str}, ...],
+        "summary": {<mode>: <row_count>, ...}}``. Both `start` and `end` are
+        inclusive (0-based row indices within the episode).
+
+        Returns ``None`` when the source schema lacks an ``action_source``
+        column — i.e. legacy (pre-HIL) datasets — so the frontend can hide the
+        track entirely instead of rendering a meaningless full-width span.
+        """
+        ep_idx = int(episode_index)
+        ep = self._episodes[ep_idx]
+        if "action_source" not in ep.non_blob_columns:
+            return None
+        df = ep.read_columns(["action_source"], offset=0, length=ep.row_count)
+        values = df["action_source"].astype(str).tolist()
+        return _aggregate_action_source_spans(values)
 
     # ---- Row reading ----------------------------------------------------------
 

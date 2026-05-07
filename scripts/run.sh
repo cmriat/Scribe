@@ -8,7 +8,7 @@ HF_HOME="${PROJECT_ROOT}/.hf_cache"
 HF_DATASETS_CACHE="${HF_HOME}/datasets"
 
 # ---- 可改参数 ----
-DATASET_ROOT="${DATASET_ROOT:-/home/jovyan/code/lance_data_collections/20260428_qz4_bigshirt_30HZ.lance}"
+DATASET_ROOT="${DATASET_ROOT:-/home/jovyan/code/lance_data_collections/hil_dataset/20260507_qz3_hil_30HZ.lance}"
 REPO_ID="${REPO_ID:-local/qz2-fold-bigshirt}"
 PORT="${PORT:-9006}"
 HOST="${HOST:-0.0.0.0}"
