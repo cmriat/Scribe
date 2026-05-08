@@ -61,7 +61,40 @@ FFPROBE_BIN = _find_bin("ffprobe")
 
 LANCE_SUFFIX = ".lance"
 CAMERA_KEYS_DEFAULT = ("mid", "left", "right")
-VIDEO_CACHE_VERSION = "h264copy_v1"
+
+# Cache namespace policy slugs. Coexist on disk so switching policies doesn't
+# clobber prior caches (rollback-safe).
+#   copy     — `-c:v copy` remux. Preserves source bitrate (fast, same size as source).
+#   reencode — `libx264 -preset fast -crf 23 -bf 0 -fps_mode passthrough` with
+#              ffprobe frame-count assertion before publish. Typical 7-20× smaller
+#              MP4s for sources that were recorded with `speed-preset=ultrafast`
+#              + no CRF (high source bitrate). Falls back to copy on validation
+#              failure so frame mapping is never silently broken.
+_VIDEO_CACHE_VERSIONS = {
+    "copy":     "h264copy_v1",
+    "reencode": "h264reencode_crf23_v1",
+}
+# Default = copy (matches §5.1 invariant). HIL / slow-network users opt in via
+# `LANCE_VIDEO_POLICY=reencode` env var.
+_DEFAULT_VIDEO_POLICY = "copy"
+
+# Backwards-compat alias for any external callers.
+VIDEO_CACHE_VERSION = _VIDEO_CACHE_VERSIONS[_DEFAULT_VIDEO_POLICY]
+
+
+def _video_policy() -> str:
+    raw = (os.environ.get("LANCE_VIDEO_POLICY") or _DEFAULT_VIDEO_POLICY).strip().lower()
+    if raw not in _VIDEO_CACHE_VERSIONS:
+        logger.warning(
+            "unknown LANCE_VIDEO_POLICY=%r (allowed: %s); using %s",
+            raw, sorted(_VIDEO_CACHE_VERSIONS), _DEFAULT_VIDEO_POLICY,
+        )
+        return _DEFAULT_VIDEO_POLICY
+    return raw
+
+
+def _video_cache_version() -> str:
+    return _VIDEO_CACHE_VERSIONS[_video_policy()]
 
 
 @dataclass(frozen=True)
@@ -71,12 +104,39 @@ class _GopLayout:
 
 
 def _dataset_runtime_namespace(root: Path, repo_id: str) -> str:
-    """Build a stable, filesystem-safe runtime namespace for one lance dataset."""
+    """Build a stable, filesystem-safe runtime namespace for one lance dataset.
+
+    The trailing slug is the *current policy's* cache version, so MP4s from
+    `copy` and `reencode` policies live in distinct directories — no collision,
+    no half-mixed cache.
+    """
     root = Path(root).resolve()
     stem = root.stem if root.suffix == LANCE_SUFFIX else root.name
     slug = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem).strip("_") or "dataset"
     digest = hashlib.sha1(f"{root}|{repo_id}".encode("utf-8")).hexdigest()[:12]
-    return f"{slug}_{digest}_{VIDEO_CACHE_VERSION}"
+    return f"{slug}_{digest}_{_video_cache_version()}"
+
+
+def _ffprobe_frame_count(path: Path) -> int | None:
+    """Count actual decoded frames in a video file (not the metadata `nb_frames`,
+    which is unreliable). Returns None on probe failure (treat as assertion fail
+    upstream)."""
+    try:
+        r = subprocess.run(
+            [
+                FFPROBE_BIN, "-v", "error", "-count_frames",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            return None
+        return int(r.stdout.strip())
+    except (subprocess.SubprocessError, ValueError):
+        return None
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -989,72 +1049,33 @@ class LanceDataset:
             out.parent.mkdir(parents=True, exist_ok=True)
             ep = self._episodes[episode_index]
             fps = ep.camera_fps(cam)
-            logger.info("LanceDataset: remuxing ep=%d cam=%s fps=%.3f -> %s", episode_index, cam, fps, out)
+            policy = _video_policy()
+            # Lower bound on output frame count: every row's mapped MP4 frame
+            # index must be addressable. If re-encode produces fewer than this,
+            # the seek mapping is broken — abort that path and fall back.
+            row_indices = ep.video_frame_indices_for_rows(cam)
+            min_required_frames = int(row_indices.max()) + 1 if row_indices.size else 0
+            logger.info(
+                "LanceDataset: materialize ep=%d cam=%s fps=%.3f policy=%s min_frames=%d -> %s",
+                episode_index, cam, fps, policy, min_required_frames, out,
+            )
             tmp = out.with_suffix(".mp4.part")
             try:
-                r = self._run_ffmpeg_with_episode_stream(
-                    ep,
-                    cam,
-                    [
-                        FFMPEG_BIN,
-                        "-y",
-                        "-loglevel",
-                        "error",
-                        "-fflags",
-                        "+genpts",
-                        "-f",
-                        "h264",
-                        "-framerate",
-                        f"{fps:.6f}",
-                        "-i",
-                        "-",
-                        "-c:v",
-                        "copy",
-                        "-movflags",
-                        "+faststart",
-                        "-f",
-                        "mp4",
-                        str(tmp),
-                    ],
-                )
-                if r.returncode != 0:
-                    logger.warning(
-                        "copy remux failed ep=%d cam=%s: %s; falling back to intra-frame encode",
-                        episode_index,
-                        cam,
-                        r.stderr.decode(errors="replace")[:500],
+                # ── Tier 1: policy-preferred path ─────────────────────────────
+                produced = False
+                if policy == "reencode":
+                    produced = self._materialize_reencode(
+                        ep, cam, fps, episode_index, tmp, min_required_frames,
                     )
-                    r = self._run_ffmpeg_with_episode_stream(
-                        ep,
-                        cam,
-                        [
-                            FFMPEG_BIN,
-                            "-y",
-                            "-loglevel",
-                            "error",
-                            "-f",
-                            "h264",
-                            "-framerate",
-                            f"{fps:.6f}",
-                            "-i",
-                            "-",
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "ultrafast",
-                            "-crf",
-                            "18",
-                            "-g",
-                            "1",
-                            "-movflags",
-                            "+faststart",
-                            "-f",
-                            "mp4",
-                            str(tmp),
-                        ],
-                    )
-                    if r.returncode != 0:
-                        raise RuntimeError(f"ffmpeg encode failed: {r.stderr.decode(errors='replace')[:500]}")
+                # ── Tier 2: -c:v copy remux (fast, original bitrate) ──────────
+                # Always available as a safety fallback when reencode fails
+                # frame-count validation, OR as the primary path under policy=copy.
+                if not produced:
+                    produced = self._materialize_copy(ep, cam, fps, episode_index, tmp)
+                # ── Tier 3: intra-frame libx264 fallback (legacy behavior) ────
+                # Only reached if both copy and (when applicable) reencode failed.
+                if not produced:
+                    self._materialize_intra_fallback(ep, cam, fps, episode_index, tmp)
                 tmp.replace(out)
             finally:
                 if tmp.exists():
@@ -1063,6 +1084,122 @@ class LanceDataset:
                     except OSError:
                         pass
         return out
+
+    def _materialize_reencode(
+        self,
+        ep: _EpisodeLance,
+        cam: str,
+        fps: float,
+        episode_index: int,
+        tmp: Path,
+        min_required_frames: int,
+    ) -> bool:
+        """Re-encode source GOPs to a smaller, browser-friendly MP4.
+
+        Frame-exact contract: `-fps_mode passthrough` keeps every input frame,
+        `-bf 0` prevents B-frame reorder, and we ffprobe-count the output to
+        ASSERT the frame mapping survived. On any failure (encode error or
+        count below required), returns False so the caller falls back to copy.
+        """
+        gop_size = max(1, int(round(fps)))  # ~1 keyframe/sec; aligns with ~30Hz HIL
+        r = self._run_ffmpeg_with_episode_stream(
+            ep, cam,
+            [
+                FFMPEG_BIN, "-y", "-loglevel", "error",
+                "-fflags", "+genpts",
+                "-f", "h264", "-framerate", f"{fps:.6f}",
+                "-i", "-",
+                "-map", "0:v:0", "-an", "-sn", "-dn",
+                "-fps_mode", "passthrough",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-bf", "0", "-g", str(gop_size), "-keyint_min", str(gop_size),
+                "-sc_threshold", "0",
+                "-video_track_timescale", "90000",
+                "-movflags", "+faststart",
+                "-f", "mp4", str(tmp),
+            ],
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "reencode failed ep=%d cam=%s: %s; will fall back to copy",
+                episode_index, cam, r.stderr.decode(errors="replace")[:500],
+            )
+            if tmp.exists():
+                tmp.unlink()
+            return False
+        encoded = _ffprobe_frame_count(tmp)
+        if encoded is None or encoded < min_required_frames:
+            logger.warning(
+                "reencode frame-count validation failed ep=%d cam=%s: encoded=%s "
+                "< required=%d; falling back to copy to preserve seek mapping",
+                episode_index, cam, encoded, min_required_frames,
+            )
+            if tmp.exists():
+                tmp.unlink()
+            return False
+        logger.info(
+            "reencode ok ep=%d cam=%s frames=%d (>= %d required)",
+            episode_index, cam, encoded, min_required_frames,
+        )
+        return True
+
+    def _materialize_copy(
+        self,
+        ep: _EpisodeLance,
+        cam: str,
+        fps: float,
+        episode_index: int,
+        tmp: Path,
+    ) -> bool:
+        """`-c:v copy` remux. Preserves source bitrate exactly. Returns True on success."""
+        r = self._run_ffmpeg_with_episode_stream(
+            ep, cam,
+            [
+                FFMPEG_BIN, "-y", "-loglevel", "error",
+                "-fflags", "+genpts",
+                "-f", "h264", "-framerate", f"{fps:.6f}",
+                "-i", "-",
+                "-c:v", "copy",
+                "-movflags", "+faststart",
+                "-f", "mp4", str(tmp),
+            ],
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "copy remux failed ep=%d cam=%s: %s; falling back to intra-frame encode",
+                episode_index, cam, r.stderr.decode(errors="replace")[:500],
+            )
+            if tmp.exists():
+                tmp.unlink()
+            return False
+        return True
+
+    def _materialize_intra_fallback(
+        self,
+        ep: _EpisodeLance,
+        cam: str,
+        fps: float,
+        episode_index: int,
+        tmp: Path,
+    ) -> None:
+        """Last-resort intra-frame encode. Bigger files but always works.
+
+        Raises RuntimeError if even this fails (no MP4 produced for this cam)."""
+        r = self._run_ffmpeg_with_episode_stream(
+            ep, cam,
+            [
+                FFMPEG_BIN, "-y", "-loglevel", "error",
+                "-f", "h264", "-framerate", f"{fps:.6f}",
+                "-i", "-",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "18", "-g", "1",
+                "-movflags", "+faststart",
+                "-f", "mp4", str(tmp),
+            ],
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg encode failed: {r.stderr.decode(errors='replace')[:500]}")
 
     @staticmethod
     def _run_ffmpeg_with_episode_stream(ep: _EpisodeLance, cam: str, cmd: list[str]) -> subprocess.CompletedProcess:

@@ -14,14 +14,21 @@ PORT="${PORT:-9006}"
 HOST="${HOST:-0.0.0.0}"
 # ARM3D=true  -> 显示 3D 机械臂
 # ARM3D=false -> 关闭 3D 机械臂面板
-ARM3D="${ARM3D:-true}"
+ARM3D="${ARM3D:-false}"
 # Lance 视频默认按需 materialize，不在启动时全量扫完整数据集。
-LANCE_PREENCODE_ALL="${LANCE_PREENCODE_ALL:-false}"
+LANCE_PREENCODE_ALL="${LANCE_PREENCODE_ALL:-true}"
 LANCE_PRELOAD_NEXT="${LANCE_PRELOAD_NEXT:-true}"
 LANCE_VIDEO_WORKERS="${LANCE_VIDEO_WORKERS:-3}"
+# Video materialization policy for Lance datasets:
+#   copy     — `-c:v copy` remux (fast, preserves source bitrate). Default.
+#   reencode — libx264 -preset fast -crf 23, with ffprobe frame-count
+#              assertion before publish. Falls back to copy on validation
+#              failure. ~7-20× smaller MP4s when source was recorded with
+#              `speed-preset=ultrafast`. Recommended for HIL data review.
+LANCE_VIDEO_POLICY="${LANCE_VIDEO_POLICY:-reencode}"
 
 mkdir -p "${OUTPUT_DIR}" "${HF_DATASETS_CACHE}"
-export HF_HOME HF_DATASETS_CACHE LANCE_PREENCODE_ALL LANCE_PRELOAD_NEXT LANCE_VIDEO_WORKERS
+export HF_HOME HF_DATASETS_CACHE LANCE_PREENCODE_ALL LANCE_PRELOAD_NEXT LANCE_VIDEO_WORKERS LANCE_VIDEO_POLICY
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 cd "${PROJECT_ROOT}"
@@ -36,7 +43,7 @@ echo "[run.sh] dataset : ${DATASET_ROOT}"
 echo "[run.sh] repo-id : ${REPO_ID}"
 echo "[run.sh] serving : http://${HOST}:${PORT}/"
 echo "[run.sh] arm3d   : ${ARM3D}"
-echo "[run.sh] lance   : preencode_all=${LANCE_PREENCODE_ALL}, preload_next=${LANCE_PRELOAD_NEXT}, video_workers=${LANCE_VIDEO_WORKERS}"
+echo "[run.sh] lance   : preencode_all=${LANCE_PREENCODE_ALL}, preload_next=${LANCE_PRELOAD_NEXT}, video_workers=${LANCE_VIDEO_WORKERS}, video_policy=${LANCE_VIDEO_POLICY}"
 
 exec "${PY}" -m scribe \
       --root "${DATASET_ROOT}" \

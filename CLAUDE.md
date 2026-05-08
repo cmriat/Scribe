@@ -159,10 +159,13 @@ scripts/run.sh
 ## 5.1) Lance 可视化不变量
 
 - `LanceDataset` 将 robot state/action/velocity/effort 保持在原始行频率；`data.get_episode_data()` 不做行级降采样。
-- Lance 相机数据以 H264 Annex B GOP blob 存储。后端优先使用 `ffmpeg -c:v copy` 将唯一 GOP 拼接并 remux 为浏览器可播 MP4。
+- Lance 相机数据以 H264 Annex B GOP blob 存储。后端有两种 materialize 策略，由 `LANCE_VIDEO_POLICY` env 选择：
+  - `copy`（默认）：`ffmpeg -c:v copy` 将唯一 GOP 拼接并 remux 为浏览器可播 MP4，保留源码率，最快。
+  - `reencode`：`libx264 -preset fast -crf 23 -bf 0 -fps_mode passthrough`，编完后用 `ffprobe -count_frames` 强制校验输出帧数 ≥ 行映射所需的最大帧号 + 1；不通过则自动 fallback 到 `copy`，绝不允许产出"帧映射悄悄破损"的 MP4。当源视频用 `speed-preset=ultrafast` 录制（典型 HIL 数据）时，文件可缩 7-20 倍。
+- 任何 lossy re-encode 必须保持 row N → MP4 frame N 的索引契约：用 `-fps_mode passthrough` + `-bf 0` + 帧数断言；不允许丢帧、补帧、重排。
 - GOP blob 写入 ffmpeg 时必须走 stdin 流式写入，避免把完整 episode 的 H264 bytes 一次性 `join` 到 Python 内存中。
 - `LANCE_VIDEO_WORKERS` 默认值为 `3`，对应 `left` / `mid` / `right` 三路相机并行 materialize；调大前需要确认磁盘 IO 和 CPU 足够。
-- Runtime 视频缓存路径包含 `VIDEO_CACHE_VERSION`，避免新旧 MP4 策略混用。
+- Runtime 视频缓存路径包含 *策略版本号*（`h264copy_v1` / `h264reencode_crf23_v1` / 等），切换 `LANCE_VIDEO_POLICY` 自动落到不同子目录，新旧策略 MP4 不会混存。
 - `get_episode_video_seek_info()` 返回 `video_frame_indices`，由每行的 `*_gop_index` 与 `*_frame_index_in_gop` 计算得到，表示该 robot 行对应 materialized MP4 的内部帧号。
 - 前端 `frameIndexToVideoTime()` / `videoTimeToFrameIndex()` 必须优先使用 `video_frame_indices`；旧的 `frame_ids` 仅作为兼容 fallback。
 - 播放同步优先使用 `requestVideoFrameCallback`，按实际呈现视频帧驱动 Dygraph selection、表格和 3D 机械臂；无该 API 时才回退到 `timeupdate`。
