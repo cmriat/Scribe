@@ -2,11 +2,13 @@
 
 **LeRobot 数据集可视化与标注工具**
 
-基于 Flask 的 Web 应用，用于可视化和标注 [LeRobot v2.1](https://github.com/huggingface/lerobot) 格式的机器人操作数据集。支持本地数据集和 HuggingFace Hub 远程数据集。
+基于 Flask 的 Web 应用，用于可视化和标注 [LeRobot v2.1](https://github.com/huggingface/lerobot) 格式的机器人操作数据集。支持本地数据集、HuggingFace Hub 远程数据集，以及**直接从 BOS / S3 对象存储在线浏览 Lance 数据集**。
 
-当前版本：v0.2.0
+当前版本：v0.3.0
 
-v0.2.0 主要完成本地 Lance 数据集可视化适配：支持 `.lance` episode/episode 目录按需打开，支持三路相机 H264 GOP blob materialize 为 MP4，并保持每一行机械臂数据与原始 Lance 相机帧对齐。Lance 数据集上的标注流程尚未完成专项测试和适配，计划在下一版本处理。
+v0.3.0 新增 **BOS / S3 在线可视化**：给一个对象存储前缀即可在登录页列出其下所有 Lance 数据集，点击后按需打开，数据通过 Lance 的 object_store 直接从 BOS 流式读取，无需先整份下载；标注 sidecar 在打开时拉到本地、编辑落本地、再自动回写 BOS。详见下文 [BOS / S3 在线可视化](#bos--s3-在线可视化)。
+
+v0.2.0 完成本地 Lance 数据集可视化适配：支持 `.lance` episode/episode 目录按需打开，支持三路相机 H264 GOP blob materialize 为 MP4，并保持每一行机械臂数据与原始 Lance 相机帧对齐。Lance 数据集上的标注流程尚未完成专项测试和适配。
 
 ## 核心功能
 
@@ -16,6 +18,7 @@ v0.2.0 主要完成本地 Lance 数据集可视化适配：支持 `.lance` episo
 - SBS1 双臂 3D 模型联动（URDF 驱动）
 - 表格数据勾选显隐
 - 本地 Lance 数据集按需可视化（保持原始帧/机械臂数据对齐）
+- BOS / S3 在线 Lance 数据集浏览（登录页选数据集，数据直读对象存储）
 
 **标注**
 - Episode 级 Curation（Keep / Delete 标记）
@@ -31,14 +34,19 @@ Scribe/
 │   ├── app.py                   # CLI 入口、资源准备、服务启动
 │   ├── routes.py                # Flask 路由（页面 + API）
 │   ├── data.py                  # 数据加载、LRU 缓存、CSV 生成
-│   ├── lance_backend.py         # Lance 数据集适配、GOP 视频 materialize、帧映射
+│   ├── lance_backend.py         # Lance 数据集适配、GOP 视频 materialize、帧映射（支持 bos:// 直读）
+│   ├── bos_discovery.py         # BOS/S3 前缀下 Lance 数据集发现（merged / raw_episodes）
+│   ├── dataset_registry.py      # 进程级数据集注册表、远程数据集 LRU 懒加载
+│   ├── bos_sync.py              # 标注 sidecar 的 BOS pull/push + AutoSaver
 │   ├── annotation_store.py      # 标注 sidecar 存储（CRUD + 校验）
 │   ├── export.py                # 离线导出脚本
 │   ├── templates/
-│   │   └── visualize.html       # 前端主界面（Alpine.js）
+│   │   ├── visualize.html       # 前端主界面（Alpine.js）
+│   │   └── landing.html         # BOS 数据集选择登录页
 │   └── vendor/                  # 前端依赖（需下载，见下文）
 ├── scripts/
-│   ├── run.sh                   # 启动脚本
+│   ├── run.sh                   # 本地单数据集启动脚本
+│   ├── run_bos.sh               # BOS / S3 landing 模式启动脚本
 │   └── download_vendor.sh       # 下载前端依赖
 ├── robot_assets/                # SBS1 双臂 URDF/Xacro/STL
 ├── pixi.toml                    # 依赖管理 + task 定义
@@ -93,6 +101,51 @@ python -m scribe \
 ```bash
 ARM3D=false pixi run serve   # 关闭 3D 面板
 ```
+
+### BOS / S3 在线可视化
+
+无需把数据集下载到本地，给一个对象存储前缀即可在登录页浏览其下所有 Lance 数据集。
+
+```bash
+# 1. 在 shell 里 export BOS 凭据（不要写进脚本提交到 git）
+export AWS_ENDPOINT_URL=https://s3.bj.bcebos.com
+export AWS_ACCESS_KEY_ID=你的AK
+export AWS_SECRET_ACCESS_KEY=你的SK
+export AWS_DEFAULT_REGION=bj
+
+# 2. 启动 landing 模式（只需改脚本顶部 BOS_PREFIX 一行）
+bash scripts/run_bos.sh
+```
+
+等价模块入口：
+
+```bash
+python -m scribe \
+  --bos-prefix bos://srgdata/robot/lance_qz_training_data/ \
+  --output-dir ./.visualizer_runtime \
+  --host 0.0.0.0 --port 9006 \
+  --autosave-interval-s 60
+```
+
+浏览器打开后会看到登录页，列出前缀下识别到的两种 Lance 数据集：
+
+- **merged** — 单个 `<name>.lance` 目录（降采样合并后的训练输出）
+- **raw_episodes** — 含 `episode_*.lance` 子目录的目录（每集原始采集）
+
+点击任意数据集即按需打开。要点：
+
+- `--bos-prefix` 与 `--root` / `--repo-id` / `--load-from-hf-hub` **互斥**。
+- 数据直读：BOS 与 S3 协议兼容，代码在边界把 `bos://` 改写成 `s3://`，endpoint 由 `AWS_ENDPOINT_URL` 决定；机械臂列和相机 GOP blob 通过 Lance object_store 流式读取，只有 materialize 出的 MP4 缓存到本地。
+- 标注 sidecar 打开时从 `<uri>/annotations/` 拉到本地缓存 `<output_dir>/bos_annotation_cache/<ns>__<name>/annotations/`，编辑落本地文件，再由 Save / `AutoSaver`（默认 60s）/ LRU 驱逐 / 进程退出自动回写 BOS。
+- **单用户 MVP**：无多用户冲突检测，多人同时标注同一数据集会互相覆盖。
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `--bos-prefix` | — | BOS / S3 前缀 URI（必填，进入 landing 模式） |
+| `--autosave-interval-s` | `60` | 标注后台回写 BOS 的间隔（秒） |
+| `SCRIBE_DATASET_LRU` | `3` | 同时常驻内存的远程数据集数量上限 |
+| `AWS_ENDPOINT_URL` | — | BOS endpoint（如 `https://s3.bj.bcebos.com`） |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | — | BOS 凭据（请走环境变量，勿硬编码提交） |
 
 ### Lance 数据集可视化
 
@@ -248,9 +301,17 @@ exports/subtask_export/
 
 | 路由 | 说明 |
 |------|------|
-| `GET /` | 主页/跳转 |
+| `GET /` | 主页/跳转；landing 模式下渲染 BOS 数据集列表 |
 | `GET /<ns>/<name>/episode_<id>` | Episode 可视化页 |
 | `GET /<ns>/<name>/episode_<id>.json` | Episode 数据（JSON，用于同页切换） |
+
+### BOS / 同步 API（仅 landing 模式）
+
+| 路由 | 方法 | 说明 |
+|------|------|------|
+| `/api/bos/refresh` | POST | 清除发现缓存、刷新数据集列表 |
+| `/<ns>/<name>/api/sync-now` | POST | 立即把该数据集标注回写到 BOS |
+| `/<ns>/<name>/api/sync-status` | GET | 查询该数据集的同步状态 |
 
 ### 标注 API
 
@@ -279,6 +340,8 @@ exports/subtask_export/
 - **后端**：Python 3.10 + Flask + LeRobot
 - **前端**：Alpine.js + Tailwind CSS + Dygraph + Three.js
 - **3D 渲染**：Three.js + STLLoader（URDF 驱动）
+- **数据格式**：LeRobot v2.1 + Lance（本地 / BOS / S3）
+- **对象存储**：Lance object_store（数据直读）+ s3fs / fsspec（发现与标注同步）
 - **依赖管理**：pixi (conda-forge + PyPI)
 - **代码检查**：Ruff
 

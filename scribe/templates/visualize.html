@@ -155,11 +155,40 @@
     <!-- Sidebar -->
     <div x-ref="sidebar" :style="sidebarStyle()" class="relative bg-zinc-900 p-5 break-words overflow-y-auto shrink-0 md:shrink-0 md:max-h-screen">
         <!-- Logo area - customizable -->
-        <div class="hidden md:block mb-2">
+        <div class="hidden md:block mb-2 flex items-center gap-2">
             <div class="text-xl font-bold text-zinc-200">Dataset Visualizer V1.2.2</div>
+            {% if landing_url %}
+            <a href="{{ landing_url }}"
+               class="ml-auto text-xs px-2 py-0.5 rounded border border-zinc-700 text-zinc-300 hover:bg-zinc-800"
+               title="Back to BOS landing">← Landing</a>
+            {% endif %}
         </div>
         <!-- Dataset title - no external link -->
         <h4 class="mb-1 text-base font-semibold">{{ dataset_info.repo_id }}</h4>
+
+        {% if sync_enabled %}
+        <!-- BOS sync controls (landing mode only) -->
+        <div class="mt-2 mb-3 p-2 text-xs border border-zinc-700 rounded bg-black/40"
+             x-data="bosSyncControls()" x-init="init()">
+            <div class="flex items-center justify-between gap-2">
+                <span class="font-semibold">BOS sync</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded"
+                      :class="syncStatusBadgeClass()"
+                      x-text="syncStatusBadgeText()"></span>
+            </div>
+            <p class="mt-1 text-zinc-500" x-text="syncStatusDetail()"></p>
+            <div class="mt-2 flex items-center gap-2">
+                <button @click="saveNow()"
+                        :disabled="saving"
+                        class="px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-200 hover:bg-zinc-800 disabled:opacity-50">
+                    <span x-show="!saving">Save now</span>
+                    <span x-show="saving">Saving…</span>
+                </button>
+                <span class="text-[10px] text-zinc-500"
+                      x-text="lastSavedLabel()"></span>
+            </div>
+        </div>
+        {% endif %}
 
         <ul class="space-y-0.5 leading-5">
             <!-- <li>
@@ -1290,6 +1319,109 @@
 
     <!-- Main JavaScript -->
     <script>
+        function bosSyncControls() {
+            // Alpine component used only when `sync_enabled` is true (i.e. the
+            // dataset came from the BOS landing page). Polls /api/sync-status
+            // periodically so the dirty badge reflects edits triggered from
+            // other tabs / the auto-saver, not just this page's own POSTs.
+            const POLL_MS = 5000;
+            const repoId = window.__DATASET_REPO_ID__ || '';
+            const [ns, name] = repoId.includes('/') ? repoId.split('/', 2) : ['', repoId];
+            const statusUrl = `/${ns}/${name}/api/sync-status`;
+            const saveUrl = `/${ns}/${name}/api/sync-now`;
+            return {
+                saving: false,
+                statusEnabled: true,
+                // `registered` distinguishes "sync slot exists but no edits
+                // yet" from "loaded + actually synced". Without it the badge
+                // would render green even before the first POST hit the
+                // server, which is misleading.
+                registered: false,
+                dirty: false,
+                lastPushedAt: null,
+                lastPulledAt: null,
+                lastPushError: null,
+                pollTimer: null,
+                init() {
+                    this.refreshStatus();
+                    this.pollTimer = setInterval(() => this.refreshStatus(), POLL_MS);
+                    window.addEventListener('beforeunload', () => {
+                        if (this.pollTimer) clearInterval(this.pollTimer);
+                    });
+                },
+                async refreshStatus() {
+                    try {
+                        const resp = await fetch(statusUrl, {cache: 'no-store'});
+                        if (!resp.ok) return;
+                        const data = await resp.json();
+                        this.statusEnabled = !!data.enabled;
+                        const s = data.status || {};
+                        this.registered = !!s.registered;
+                        this.dirty = !!s.dirty;
+                        this.lastPushedAt = s.last_pushed_at || null;
+                        this.lastPulledAt = s.last_pulled_at || null;
+                        this.lastPushError = s.last_push_error || null;
+                    } catch (err) {
+                        // Network blips are non-fatal: leave previous state in place.
+                    }
+                },
+                async saveNow() {
+                    if (this.saving) return;
+                    this.saving = true;
+                    try {
+                        const resp = await fetch(saveUrl, {method: 'POST'});
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok || data.ok === false) {
+                            throw new Error(data.error || `HTTP ${resp.status}`);
+                        }
+                        const s = data.status || {};
+                        this.dirty = !!s.dirty;
+                        this.lastPushedAt = s.last_pushed_at || this.lastPushedAt;
+                        this.lastPushError = s.last_push_error || null;
+                    } catch (err) {
+                        this.lastPushError = String(err.message || err);
+                    } finally {
+                        this.saving = false;
+                    }
+                },
+                syncStatusBadgeText() {
+                    if (this.lastPushError) return 'error';
+                    if (this.dirty) return 'unsaved';
+                    if (!this.registered) return 'idle';
+                    if (this.lastPushedAt) return 'synced';
+                    return 'untouched';
+                },
+                syncStatusBadgeClass() {
+                    if (this.lastPushError) return 'bg-red-700 text-white';
+                    if (this.dirty) return 'bg-amber-700 text-white';
+                    if (this.registered && this.lastPushedAt) return 'bg-emerald-700 text-white';
+                    return 'bg-zinc-700 text-zinc-200';
+                },
+                syncStatusDetail() {
+                    if (this.lastPushError) return `Last push error: ${this.lastPushError}`;
+                    if (this.dirty) return 'Local edits not yet pushed to BOS.';
+                    if (!this.registered) return 'No local edits yet.';
+                    if (!this.lastPushedAt) return 'Local edits not yet pushed (or no edits in this session).';
+                    return 'All edits pushed to BOS.';
+                },
+                lastSavedLabel() {
+                    if (!this.lastPushedAt) return 'never pushed';
+                    return `last push: ${formatIsoToLocal(this.lastPushedAt)}`;
+                },
+            };
+        }
+
+        function formatIsoToLocal(iso) {
+            if (!iso) return '';
+            try {
+                const d = new Date(iso);
+                if (isNaN(d.getTime())) return iso;
+                return d.toLocaleTimeString();
+            } catch (_) {
+                return iso;
+            }
+        }
+
         function createAlpineData() {
             return {
                 // state

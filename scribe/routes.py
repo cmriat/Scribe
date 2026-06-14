@@ -28,6 +28,12 @@ from scribe.data import (
     get_episode_timestamps,
     get_episode_frame_count,
 )
+from scribe.bos_sync import BosSync, AutoSaver
+from scribe.bos_discovery import (
+    DEFAULT_CACHE_TTL_S,
+    invalidate_cache as bos_discovery_invalidate_cache,
+    list_bos_datasets_cached,
+)
 from scribe.lance_backend import LanceDataset
 from scribe.annotation_store import (
     DEFAULT_SCHEME,
@@ -49,9 +55,9 @@ from scribe.annotation_store import (
     ensure_task_annotation_store,
     load_segment_annotation_store,
     save_segment_annotation_store,
-    build_local_annotation_context,
     build_segment_summary_by_episode,
 )
+from scribe.dataset_registry import DatasetRegistry, derive_slug, _RemoteEntry
 
 # ---------------------------------------------------------------------------
 # Homepage datasets
@@ -95,11 +101,7 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_episode_curation_context(
-    dataset_obj: LeRobotDataset | IterableNamespace,
-    repo_id: str,
-) -> dict:
-    annotation_context = build_local_annotation_context(dataset_obj, repo_id)
+def _build_episode_curation_context(annotation_context: dict) -> dict:
     return {
         "enabled": bool(annotation_context.get("enabled")),
         "dataset_id": annotation_context.get("dataset_id"),
@@ -167,29 +169,26 @@ def _compute_action_source_track(dataset_obj, episode_id: int) -> dict | None:
         ep_from = int(index["from"][episode_id])
         ep_to = int(index["to"][episode_id])
         rows = (
-            dataset_obj.hf_dataset
-            .select(range(ep_from, ep_to))
-            .select_columns(["action_source"])
-            .with_format("python")
+            dataset_obj.hf_dataset.select(range(ep_from, ep_to)).select_columns(["action_source"]).with_format("python")
         )
         values = [str(r["action_source"]) for r in rows]
     except (KeyError, AttributeError) as e:
         logging.warning(
             "action_source declared in features but not readable for ep=%s: %s",
-            episode_id, e,
+            episode_id,
+            e,
         )
         return None
 
     from scribe.lance_backend import _aggregate_action_source_spans
+
     return _aggregate_action_source_spans(values)
 
 
 def _build_annotation_response_context(
-    dataset_obj: LeRobotDataset | IterableNamespace,
-    repo_id: str,
+    annotation_context: dict,
     language_instruction: str | list[str] | None,
 ) -> dict:
-    annotation_context = build_local_annotation_context(dataset_obj, repo_id)
     if not annotation_context.get("enabled"):
         return {
             "enabled": False,
@@ -215,7 +214,10 @@ def _build_annotation_response_context(
 
     task_name, task_profile = resolve_task_profile(task_store, normalized_instruction)
     return build_task_context_payload(
-        annotation_context, task_name, task_profile, scheme=DEFAULT_SCHEME,
+        annotation_context,
+        task_name,
+        task_profile,
+        scheme=DEFAULT_SCHEME,
         event_types=task_store.get("event_types") or [],
     )
 
@@ -225,14 +227,31 @@ def _build_annotation_response_context(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_dataset_or_error(repo_id: str, dataset_obj):
+def _resolve_dataset_or_error(ns: str, name: str, registry: DatasetRegistry):
+    """Resolve a dataset for the (ns, name) URL pair.
+
+    Priority:
+      1. Registry hit (pinned local OR loadable remote via BOS landing).
+      2. Hub fallback via ``get_dataset_info`` — preserves the legacy
+         "navigate-to-any-repo-id-by-URL" behavior when Scribe was launched
+         without a specific dataset.
+
+    Returns the dataset object on success, or a ``(message, http_code)`` tuple
+    that the caller serialises into the appropriate response shape.
+    """
+    repo_id = f"{ns}/{name}"
     try:
-        resolved_dataset = dataset_obj if dataset_obj is not None else get_dataset_info(repo_id)
-    except FileNotFoundError:
-        return (
-            "Make sure to convert your LeRobotDataset to v2 & above. See how to convert your dataset at https://github.com/huggingface/lerobot/pull/461",
-            400,
-        )
+        resolved_dataset = registry.get(ns, name)
+    except KeyError:
+        resolved_dataset = None
+    if resolved_dataset is None:
+        try:
+            resolved_dataset = get_dataset_info(repo_id)
+        except FileNotFoundError:
+            return (
+                "Make sure to convert your LeRobotDataset to v2 & above. See how to convert your dataset at https://github.com/huggingface/lerobot/pull/461",
+                400,
+            )
 
     dataset_version = (
         str(resolved_dataset.meta._version)
@@ -257,10 +276,26 @@ def _build_stage_order_by_task(task_store: dict) -> dict[str, list[str]]:
     return stage_order_by_task
 
 
-def _load_task_store_or_error(resolved_dataset, repo_id: str):
-    annotation_context = build_local_annotation_context(resolved_dataset, repo_id)
+def _remote_uri_or_404(registry: DatasetRegistry, ns: str, name: str) -> str:
+    """Resolve the BOS URI for a registered remote dataset, or raise abort."""
+    for item in registry.list_known():
+        if item["ns"] == ns and item["name"] == name and item.get("uri"):
+            return item["uri"]
+    abort(404)
+
+
+def _load_task_store_or_error(annotation_context: dict):
     if not annotation_context["enabled"]:
-        return None, None, (jsonify({"error": "annotations only support local datasets loaded with --root"}), 400)
+        return (
+            None,
+            None,
+            (
+                jsonify(
+                    {"error": "annotations only support local datasets loaded with --root or via the BOS landing page"}
+                ),
+                400,
+            ),
+        )
 
     task_config_path = Path(annotation_context["files"]["task_config"])
     with _task_annotation_lock:
@@ -274,35 +309,139 @@ def _load_task_store_or_error(resolved_dataset, repo_id: str):
 
 
 def run_server(
-    dataset: LeRobotDataset | IterableNamespace | None,
+    registry: DatasetRegistry,
     episodes: list[int] | None,
     host: str,
-    port: str,
+    port: int,
     static_folder: Path,
     template_folder: Path,
     robot_kinematic_config: dict,
     vendor_assets: dict,
+    *,
+    initial_repo_id: str | None = None,
+    bos_prefix: str | None = None,
+    sync: BosSync | None = None,
+    auto_saver: AutoSaver | None = None,
 ):
     app = Flask(__name__, static_folder=static_folder.resolve(), template_folder=template_folder.resolve())
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-    dataset_video_root = None
-    if isinstance(dataset, LOCAL_DATASET_TYPES):
-        # LanceDataset carries its own video_root (runtime MP4 materialization).
-        candidate = getattr(dataset, "video_root", None) or (dataset.root / "videos")
-        if candidate.exists():
-            dataset_video_root = candidate.resolve()
+    landing_mode = bos_prefix is not None
+    cache_ttl_s = DEFAULT_CACHE_TTL_S
 
-    @app.route("/local_videos/<path:video_rel_path>")
-    def local_video_file(video_rel_path: str):
-        if dataset_video_root is None:
+    def _mark_sync_dirty(ns: str, name: str) -> None:
+        """Notify the sync layer that this dataset's sidecar files changed.
+
+        Idempotent and no-op when sync isn't configured (legacy ``--root``
+        mode) or when the dataset is pinned-local (no BOS to push to).
+        """
+        if sync is None:
+            return
+        sync.mark_dirty(ns, name)
+
+    def _dataset_video_root(ns: str, name: str) -> Path | None:
+        """Resolve the on-disk video root for a registered dataset.
+
+        Lance datasets carry their own ``video_root`` under ``runtime_dir``.
+        LeRobotDataset (legacy ``--root``) keeps videos under ``<root>/videos``.
+        Returns ``None`` if the directory does not yet exist (e.g. during
+        first-ever access before any video has been materialised — the route
+        replies 404 in that case).
+        """
+        try:
+            ds = registry.get(ns, name)
+        except KeyError:
+            return None
+        candidate = getattr(ds, "video_root", None)
+        if candidate is None and isinstance(ds, LOCAL_DATASET_TYPES):
+            candidate = ds.root / "videos"
+        if candidate is None or not Path(candidate).exists():
+            return None
+        return Path(candidate).resolve()
+
+    @app.route("/local_videos/<string:dataset_namespace>/<string:dataset_name>/<path:video_rel_path>")
+    def local_video_file(dataset_namespace: str, dataset_name: str, video_rel_path: str):
+        video_root = _dataset_video_root(dataset_namespace, dataset_name)
+        if video_root is None:
             abort(404)
-        return send_from_directory(dataset_video_root.as_posix(), video_rel_path, conditional=True)
+        return send_from_directory(video_root.as_posix(), video_rel_path, conditional=True)
 
     @app.route("/")
-    def hommepage(dataset=dataset):
-        if dataset:
-            dataset_namespace, dataset_name = split_repo_id(dataset.repo_id)
+    def homepage():
+        # 1. Landing mode (BOS prefix configured): show dataset list.
+        if landing_mode:
+            try:
+                discovered = list_bos_datasets_cached(bos_prefix)
+            except Exception as exc:  # network errors render as the page itself
+                logging.exception("BOS discovery failed for %s", bos_prefix)
+                return render_template(
+                    "landing.html",
+                    bos_prefix=bos_prefix,
+                    discovered=[],
+                    pinned=[],
+                    error=str(exc),
+                    cache_ttl_s=cache_ttl_s,
+                    vendor_assets=vendor_assets,
+                )
+            remote_entries = [
+                _RemoteEntry(
+                    ns="bos",
+                    name=derive_slug(entry.name),
+                    uri=entry.uri,
+                    form=entry.form,
+                    episode_count=entry.episode_count,
+                )
+                for entry in discovered
+            ]
+            # register_remote_batch may rename entries to break slug
+            # collisions; use the returned values so view rows + registry
+            # both point at the same `(ns, name)`.
+            registered = registry.register_remote_batch(remote_entries)
+            # Build the view rows (annotate with display name + open URL).
+            view_rows = []
+            for entry, remote in zip(discovered, registered, strict=True):
+                view_rows.append(
+                    {
+                        "display_name": entry.name,
+                        "ns": remote.ns,
+                        "name": remote.name,
+                        "uri": remote.uri,
+                        "form": entry.form,
+                        "episode_count": entry.episode_count,
+                        "open_url": url_for(
+                            "show_first_episode",
+                            dataset_namespace=remote.ns,
+                            dataset_name=remote.name,
+                        ),
+                    }
+                )
+            pinned_rows = [
+                {
+                    "ns": item["ns"],
+                    "name": item["name"],
+                    "episode_count": item.get("episode_count"),
+                    "open_url": url_for(
+                        "show_first_episode",
+                        dataset_namespace=item["ns"],
+                        dataset_name=item["name"],
+                    ),
+                }
+                for item in registry.list_known()
+                if item["source"] == "pinned"
+            ]
+            return render_template(
+                "landing.html",
+                bos_prefix=bos_prefix,
+                discovered=view_rows,
+                pinned=pinned_rows,
+                error=None,
+                cache_ttl_s=cache_ttl_s,
+                vendor_assets=vendor_assets,
+            )
+
+        # 2. Single-dataset mode (legacy --root or --repo-id): straight redirect.
+        if initial_repo_id:
+            dataset_namespace, dataset_name = split_repo_id(initial_repo_id)
             return redirect(
                 url_for(
                     "show_episode",
@@ -312,6 +451,7 @@ def run_server(
                 )
             )
 
+        # 3. Anonymous browse mode (legacy hub homepage with featured list).
         dataset_param, episode_param = None, None
         all_params = request.args
         if "dataset" in all_params:
@@ -348,13 +488,44 @@ def run_server(
             )
         )
 
+    @app.route("/api/bos/refresh", methods=["POST"])
+    def refresh_bos_listing():
+        if not landing_mode:
+            return jsonify({"error": "BOS landing not configured"}), 400
+        bos_discovery_invalidate_cache(bos_prefix)
+        return jsonify({"ok": True})
+
+    @app.route("/<string:dataset_namespace>/<string:dataset_name>/api/sync-now", methods=["POST"])
+    def sync_dataset_now(dataset_namespace, dataset_name):
+        if sync is None:
+            return jsonify({"error": "BOS sync not configured"}), 400
+        try:
+            sync.register(
+                ns=dataset_namespace,
+                name=dataset_name,
+                uri=_remote_uri_or_404(registry, dataset_namespace, dataset_name),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        ok = sync.push(ns=dataset_namespace, name=dataset_name, force=True)
+        return jsonify({"ok": ok, "status": sync.status(dataset_namespace, dataset_name)})
+
+    @app.route("/<string:dataset_namespace>/<string:dataset_name>/api/sync-status", methods=["GET"])
+    def sync_dataset_status(dataset_namespace, dataset_name):
+        if sync is None:
+            return jsonify({"enabled": False})
+        return jsonify({"enabled": True, "status": sync.status(dataset_namespace, dataset_name)})
+
     def _build_episode_payload(
         dataset_obj: LeRobotDataset | IterableNamespace,
         repo_id: str,
+        dataset_namespace: str,
+        dataset_name: str,
         episode_id: int,
         episodes_value: list[int] | None,
     ) -> dict:
-        curation_context = _build_episode_curation_context(dataset_obj, repo_id)
+        annotation_context = registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        curation_context = _build_episode_curation_context(annotation_context)
         current_preload_thread = None
         current_preload_errors: list[Exception] = []
         if isinstance(dataset_obj, LanceDataset):
@@ -405,12 +576,13 @@ def run_server(
                         daemon=True,
                     ).start()
             video_paths = [dataset_obj.meta.get_video_file_path(episode_id, key) for key in dataset_obj.meta.video_keys]
+            video_root_here = _dataset_video_root(dataset_namespace, dataset_name)
             videos_info = []
             for video_path in video_paths:
                 normalized_video_path = Path(video_path)
-                if normalized_video_path.is_absolute() and dataset_video_root is not None:
+                if normalized_video_path.is_absolute() and video_root_here is not None:
                     try:
-                        normalized_video_path = normalized_video_path.relative_to(dataset_video_root)
+                        normalized_video_path = normalized_video_path.relative_to(video_root_here)
                     except ValueError:
                         normalized_video_path = Path(video_path.name)
 
@@ -420,7 +592,12 @@ def run_server(
 
                 videos_info.append(
                     {
-                        "url": url_for("local_video_file", video_rel_path=video_rel_path),
+                        "url": url_for(
+                            "local_video_file",
+                            dataset_namespace=dataset_namespace,
+                            dataset_name=dataset_name,
+                            video_rel_path=video_rel_path,
+                        ),
                         "filename": video_path.parent.name,
                     }
                 )
@@ -458,7 +635,7 @@ def run_server(
         if videos_info:
             videos_info[0]["language_instruction"] = tasks
 
-        annotation_context = _build_annotation_response_context(dataset_obj, repo_id, language_instruction)
+        annotation_response_context = _build_annotation_response_context(annotation_context, language_instruction)
 
         if episodes_value is None:
             episodes_value = list(
@@ -482,27 +659,26 @@ def run_server(
             "video_seek_info": video_seek_info,
             "language_instruction": language_instruction,
             "curation_context": _build_curation_response_context(curation_context),
-            "annotation_context": annotation_context,
+            "annotation_context": annotation_response_context,
             "action_source_track": action_source_track,
             "frame_count": frame_count,
         }
 
     @app.route("/<string:dataset_namespace>/<string:dataset_name>/episode_<int:episode_id>")
-    def show_episode(
-        dataset_namespace,
-        dataset_name,
-        episode_id,
-        dataset=dataset,
-        episodes=episodes,
-        robot_kinematic_config=robot_kinematic_config,
-        vendor_assets=vendor_assets,
-    ):
+    def show_episode(dataset_namespace, dataset_name, episode_id):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple) or isinstance(resolved_dataset, str):
             return resolved_dataset
 
-        payload = _build_episode_payload(resolved_dataset, repo_id, episode_id, episodes)
+        payload = _build_episode_payload(
+            resolved_dataset,
+            repo_id,
+            dataset_namespace,
+            dataset_name,
+            episode_id,
+            episodes,
+        )
 
         return render_template(
             "visualize.html",
@@ -520,35 +696,46 @@ def run_server(
             curation_context=payload["curation_context"],
             annotation_context=payload["annotation_context"],
             action_source_track=payload["action_source_track"],
+            sync_enabled=(sync is not None and registry.is_pinned(dataset_namespace, dataset_name) is False),
+            landing_url=url_for("homepage") if landing_mode else None,
         )
 
     @app.route("/<string:dataset_namespace>/<string:dataset_name>/episode_<int:episode_id>.json")
-    def show_episode_json(dataset_namespace, dataset_name, episode_id, dataset=dataset, episodes=episodes):
+    def show_episode_json(dataset_namespace, dataset_name, episode_id):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        payload = _build_episode_payload(resolved_dataset, repo_id, episode_id, episodes)
+        payload = _build_episode_payload(
+            resolved_dataset,
+            repo_id,
+            dataset_namespace,
+            dataset_name,
+            episode_id,
+            episodes,
+        )
         return jsonify(payload)
 
     @app.route(
         "/<string:dataset_namespace>/<string:dataset_name>/api/episode-curation",
         methods=["GET"],
     )
-    def get_episode_curation(dataset_namespace, dataset_name, dataset=dataset):
+    def get_episode_curation(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        curation_context = _build_episode_curation_context(resolved_dataset, repo_id)
+        curation_context = _build_episode_curation_context(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if not curation_context["enabled"]:
             return jsonify({"error": "episode curation only supports local datasets loaded with --root"}), 400
 
@@ -584,16 +771,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/episode-curation",
         methods=["POST"],
     )
-    def upsert_episode_curation(dataset_namespace, dataset_name, dataset=dataset):
+    def upsert_episode_curation(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        curation_context = _build_episode_curation_context(resolved_dataset, repo_id)
+        curation_context = _build_episode_curation_context(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if not curation_context["enabled"]:
             return jsonify({"error": "episode curation only supports local datasets loaded with --root"}), 400
 
@@ -632,6 +821,7 @@ def run_server(
             store["items"][str(episode_index)] = record
             store["updated_at"] = now_iso
             _save_episode_curation_store(storage_path, store)
+        _mark_sync_dirty(dataset_namespace, dataset_name)
 
         return jsonify(
             {
@@ -645,16 +835,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/episode-curation/export-delete-list",
         methods=["GET"],
     )
-    def export_episode_delete_candidates(dataset_namespace, dataset_name, dataset=dataset):
+    def export_episode_delete_candidates(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        curation_context = _build_episode_curation_context(resolved_dataset, repo_id)
+        curation_context = _build_episode_curation_context(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if not curation_context["enabled"]:
             return jsonify({"error": "episode curation only supports local datasets loaded with --root"}), 400
 
@@ -684,16 +876,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/task-annotation-config",
         methods=["GET"],
     )
-    def get_task_annotation_config(dataset_namespace, dataset_name, dataset=dataset):
+    def get_task_annotation_config(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        annotation_context, task_store, error_response = _load_task_store_or_error(resolved_dataset, repo_id)
+        annotation_context, task_store, error_response = _load_task_store_or_error(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if error_response is not None:
             return error_response
 
@@ -713,16 +907,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/segment-annotations",
         methods=["GET"],
     )
-    def get_segment_annotations(dataset_namespace, dataset_name, dataset=dataset):
+    def get_segment_annotations(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        annotation_context, task_store, error_response = _load_task_store_or_error(resolved_dataset, repo_id)
+        annotation_context, task_store, error_response = _load_task_store_or_error(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if error_response is not None:
             return error_response
 
@@ -788,16 +984,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/segment-annotations",
         methods=["POST"],
     )
-    def upsert_segment_annotation(dataset_namespace, dataset_name, dataset=dataset):
+    def upsert_segment_annotation(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        annotation_context, task_store, error_response = _load_task_store_or_error(resolved_dataset, repo_id)
+        annotation_context, task_store, error_response = _load_task_store_or_error(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if error_response is not None:
             return error_response
 
@@ -924,8 +1122,7 @@ def run_server(
                     if str(s.get("stage_label") or "") == parent_stage_label
                 ]
                 contained = any(
-                    int(p["frame_start"]) <= frame_start and frame_end <= int(p["frame_end"])
-                    for p in parent_segments
+                    int(p["frame_start"]) <= frame_start and frame_end <= int(p["frame_end"]) for p in parent_segments
                 )
                 if not contained:
                     return jsonify(
@@ -960,6 +1157,7 @@ def run_server(
             record["updated_at"] = utc_now_iso()
             save_segment_annotation_store(storage_path, store)
             episode_record = store["items"][str(episode_index)]
+        _mark_sync_dirty(dataset_namespace, dataset_name)
 
         summary = summarize_episode_segments(
             episode_record.get("schemes", {}).get(scheme, []),
@@ -982,16 +1180,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/segment-annotations/<string:segment_id>",
         methods=["DELETE"],
     )
-    def delete_segment_annotation(dataset_namespace, dataset_name, segment_id, dataset=dataset):
+    def delete_segment_annotation(dataset_namespace, dataset_name, segment_id):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        annotation_context, task_store, error_response = _load_task_store_or_error(resolved_dataset, repo_id)
+        annotation_context, task_store, error_response = _load_task_store_or_error(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if error_response is not None:
             return error_response
 
@@ -1036,6 +1236,7 @@ def run_server(
 
         if deleted_record is None or deleted_episode_index is None:
             return jsonify({"error": f"segment_id not found: {segment_id}"}), 404
+        _mark_sync_dirty(dataset_namespace, dataset_name)
 
         summary_scheme = deleted_scheme or DEFAULT_SCHEME
         stage_order = list(
@@ -1073,16 +1274,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/frame-events",
         methods=["GET"],
     )
-    def get_frame_events(dataset_namespace, dataset_name, dataset=dataset):
+    def get_frame_events(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        annotation_context, _, error_response = _load_task_store_or_error(resolved_dataset, repo_id)
+        annotation_context, _, error_response = _load_task_store_or_error(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if error_response is not None:
             return error_response
 
@@ -1105,16 +1308,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/frame-events",
         methods=["POST"],
     )
-    def upsert_frame_event(dataset_namespace, dataset_name, dataset=dataset):
+    def upsert_frame_event(dataset_namespace, dataset_name):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        annotation_context, task_store, error_response = _load_task_store_or_error(resolved_dataset, repo_id)
+        annotation_context, task_store, error_response = _load_task_store_or_error(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if error_response is not None:
             return error_response
 
@@ -1135,9 +1340,7 @@ def run_server(
 
         allowed_event_ids = {e.get("id") for e in (task_store.get("event_types") or []) if e.get("id")}
         if allowed_event_ids and event_type not in allowed_event_ids:
-            return jsonify(
-                {"error": f"event_type must be one of: {', '.join(sorted(allowed_event_ids))}"}
-            ), 400
+            return jsonify({"error": f"event_type must be one of: {', '.join(sorted(allowed_event_ids))}"}), 400
 
         task_name = str(payload.get("task_name") or "").strip()
         if task_name and task_name not in task_store.get("tasks", {}):
@@ -1169,6 +1372,7 @@ def run_server(
             items = [item for item in store["items"] if str(item.get("event_id") or "") != event_id]
             items.append(event_record)
             save_frame_event_records(storage_path, annotation_context["dataset_id"], items)
+        _mark_sync_dirty(dataset_namespace, dataset_name)
 
         return jsonify({"ok": True, "record": event_record})
 
@@ -1176,16 +1380,18 @@ def run_server(
         "/<string:dataset_namespace>/<string:dataset_name>/api/frame-events/<string:event_id>",
         methods=["DELETE"],
     )
-    def delete_frame_event(dataset_namespace, dataset_name, event_id, dataset=dataset):
+    def delete_frame_event(dataset_namespace, dataset_name, event_id):
         repo_id = f"{dataset_namespace}/{dataset_name}"
-        resolved_dataset = _resolve_dataset_or_error(repo_id, dataset)
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
         if isinstance(resolved_dataset, tuple):
             message, code = resolved_dataset
             return jsonify({"error": message}), code
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
-        annotation_context, _, error_response = _load_task_store_or_error(resolved_dataset, repo_id)
+        annotation_context, _, error_response = _load_task_store_or_error(
+            registry.annotation_context(dataset_namespace, dataset_name, repo_id)
+        )
         if error_response is not None:
             return error_response
 
@@ -1204,7 +1410,20 @@ def run_server(
                 return jsonify({"error": f"event_id not found: {event_id}"}), 404
 
             save_frame_event_records(storage_path, annotation_context["dataset_id"], remaining_items)
+        _mark_sync_dirty(dataset_namespace, dataset_name)
 
         return jsonify({"ok": True, "deleted_record": deleted_record})
 
-    app.run(host=host, port=port)
+    try:
+        app.run(host=host, port=port)
+    finally:
+        # On graceful shutdown (Ctrl-C), flush every pending sync edit. Errors
+        # are already logged by sync.push; we just make sure the AutoSaver
+        # thread stops cleanly.
+        if auto_saver is not None:
+            auto_saver.stop(flush=True)
+        else:
+            try:
+                registry.flush_and_close()
+            except Exception:
+                logging.exception("registry flush_and_close failed during shutdown")

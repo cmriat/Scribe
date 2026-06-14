@@ -14,9 +14,13 @@ from pathlib import Path
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from scribe.data import get_dataset_info
+from scribe.data import split_repo_id, get_dataset_info
 from scribe.routes import run_server
+from scribe.bos_sync import DEFAULT_AUTOSAVE_INTERVAL_S, BosSync, AutoSaver
+from scribe.bos_discovery import is_remote_uri
 from scribe.lance_backend import LanceDataset, is_lance_root
+from scribe.annotation_store import ANNOTATIONS_DIRNAME
+from scribe.dataset_registry import DEFAULT_LRU_SIZE, DatasetRegistry
 
 # ---------------------------------------------------------------------------
 # Robot asset constants
@@ -289,7 +293,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def visualize_dataset_html(
-    dataset: LeRobotDataset | LanceDataset | None,
+    registry: DatasetRegistry,
     episodes: list[int] | None = None,
     output_dir: Path | None = None,
     serve: bool = True,
@@ -297,6 +301,11 @@ def visualize_dataset_html(
     port: int = 9090,
     force_override: bool = False,
     enable_3darm: bool = True,
+    *,
+    initial_repo_id: str | None = None,
+    bos_prefix: str | None = None,
+    sync: BosSync | None = None,
+    auto_saver: AutoSaver | None = None,
 ) -> Path | None:
     init_logging()
 
@@ -324,30 +333,47 @@ def visualize_dataset_html(
         robot_kinematic_config = {"enabled": False}
     vendor_assets = prepare_frontend_vendor_assets(static_dir)
 
-    if dataset is None:
-        if serve:
-            run_server(
-                dataset=None,
-                episodes=None,
-                host=host,
-                port=port,
-                static_folder=static_dir,
-                template_folder=template_dir,
-                robot_kinematic_config=robot_kinematic_config,
-                vendor_assets=vendor_assets,
-            )
-    else:
-        if serve:
-            run_server(
-                dataset,
-                episodes,
-                host,
-                port,
-                static_dir,
-                template_dir,
-                robot_kinematic_config,
-                vendor_assets,
-            )
+    if not serve:
+        return output_dir
+    run_server(
+        registry=registry,
+        episodes=episodes,
+        host=host,
+        port=port,
+        static_folder=static_dir,
+        template_folder=template_dir,
+        robot_kinematic_config=robot_kinematic_config,
+        vendor_assets=vendor_assets,
+        initial_repo_id=initial_repo_id,
+        bos_prefix=bos_prefix,
+        sync=sync,
+        auto_saver=auto_saver,
+    )
+    return output_dir
+
+
+def _annotation_dir_for_local_dataset(dataset_obj) -> Path | None:
+    """Where a *pinned* local dataset stores its annotation sidecars on disk.
+
+    Returns None for hub datasets (no local sidecar) and for remote-rooted
+    LanceDatasets (those are never pinned — they go through the BOS sync
+    layer instead).
+    """
+    if not isinstance(dataset_obj, (LeRobotDataset, LanceDataset)):
+        return None
+    if getattr(dataset_obj, "root_is_remote", False):
+        return None
+    root = dataset_obj.root
+    if not isinstance(root, Path):
+        return None
+    return root.resolve() / ANNOTATIONS_DIRNAME
+
+
+def _resolve_output_dir(arg: Path | None) -> Path:
+    """Pick a stable runtime dir so LanceDataset MP4 caches survive restarts."""
+    if arg is None:
+        return Path(tempfile.mkdtemp(prefix="scribe_lance_"))
+    return Path(arg)
 
 
 def main():
@@ -364,6 +390,22 @@ def main():
         type=Path,
         default=None,
         help="Root directory for a dataset stored locally (e.g. `--root data`). By default, the dataset will be loaded from hugging face cache folder, or downloaded from the hub if available.",
+    )
+    parser.add_argument(
+        "--bos-prefix",
+        type=str,
+        default=None,
+        help=(
+            "BOS / S3 URI prefix to browse on the landing page (e.g. "
+            "`bos://srgdata/robot/lance_qz_training_data/`). Mutually exclusive "
+            "with `--root` / `--repo-id`. AWS_* env vars must be set."
+        ),
+    )
+    parser.add_argument(
+        "--autosave-interval-s",
+        type=int,
+        default=DEFAULT_AUTOSAVE_INTERVAL_S,
+        help="Seconds between background BOS annotation pushes (landing mode only).",
     )
     parser.add_argument(
         "--load-from-hf-hub",
@@ -428,60 +470,106 @@ def main():
     )
 
     args = parser.parse_args()
-    kwargs = vars(args)
-    repo_id = kwargs.pop("repo_id")
-    load_from_hf_hub = kwargs.pop("load_from_hf_hub")
-    root = kwargs.pop("root")
-    tolerance_s = kwargs.pop("tolerance_s")
-    enable_3darm = _parse_bool_flag(kwargs.pop("arm3d"), "--3darm")
-    kwargs["enable_3darm"] = enable_3darm
+    init_logging()
+    bos_prefix = args.bos_prefix
+    repo_id = args.repo_id
+    root = args.root
+    load_from_hf_hub = bool(args.load_from_hf_hub)
+    enable_3darm = _parse_bool_flag(args.arm3d, "--3darm")
 
-    dataset = None
-    if repo_id:
-        if "/" not in repo_id:
-            root_name = root.name if root is not None else repo_id
-            # Strip .lance suffix so repo-id stays clean for URLs.
-            if root_name.endswith(".lance"):
-                root_name = root_name[: -len(".lance")]
-            normalized_repo_id = f"local/{root_name}"
-            logging.info(
-                "repo-id '%s' does not include namespace/name, normalized to '%s'",
-                repo_id,
-                normalized_repo_id,
-            )
-            repo_id = normalized_repo_id
+    if bos_prefix is not None:
+        if not is_remote_uri(bos_prefix):
+            raise SystemExit(f"--bos-prefix must be a bos:// or s3:// URI, got {bos_prefix!r}")
+        if root is not None or repo_id is not None or load_from_hf_hub:
+            raise SystemExit("--bos-prefix is mutually exclusive with --root / --repo-id / --load-from-hf-hub")
 
-        if not load_from_hf_hub and is_lance_root(root):
-            # Ensure output_dir is resolved before building LanceDataset so the
-            # runtime MP4s persist across restarts in a stable location.
-            output_dir_arg = kwargs.get("output_dir")
-            if output_dir_arg is None:
-                output_dir_arg = tempfile.mkdtemp(prefix="scribe_lance_")
-                kwargs["output_dir"] = Path(output_dir_arg)
-            runtime_dir = Path(output_dir_arg) / "lance_runtime"
-            logging.info("detected lance root at %s; using runtime dir %s", root, runtime_dir)
-            dataset = LanceDataset(repo_id=repo_id, root=root, runtime_dir=runtime_dir)
-            if _env_bool("LANCE_PREENCODE_ALL", False):
+    output_dir = _resolve_output_dir(args.output_dir)
+    runtime_dir = output_dir / "lance_runtime"
 
-                def _bg_encode():
-                    for ep_i in range(dataset.num_episodes):
-                        try:
-                            dataset._preload_videos(ep_i)
-                        except Exception:
-                            logging.warning("background video materialization failed ep=%d", ep_i, exc_info=True)
-                    logging.info("background video materialization complete (%d episodes)", dataset.num_episodes)
+    sync: BosSync | None = None
+    auto_saver: AutoSaver | None = None
+    initial_repo_id: str | None = None
 
-                threading.Thread(target=_bg_encode, daemon=True).start()
+    if bos_prefix is not None:
+        sync = BosSync(local_cache_root=output_dir / "bos_annotation_cache")
+        lru_size = int(os.environ.get("SCRIBE_DATASET_LRU", DEFAULT_LRU_SIZE))
+        registry = DatasetRegistry(runtime_dir=runtime_dir, sync=sync, max_size=lru_size)
+        auto_saver = AutoSaver(sync, interval_s=args.autosave_interval_s)
+        auto_saver.start()
+        logging.info(
+            "Scribe landing mode: prefix=%s, runtime_dir=%s, lru=%d, autosave=%ds",
+            bos_prefix,
+            runtime_dir,
+            lru_size,
+            args.autosave_interval_s,
+        )
+    else:
+        registry = DatasetRegistry(runtime_dir=runtime_dir, sync=None)
+        if repo_id:
+            if "/" not in repo_id:
+                root_name = root.name if root is not None else repo_id
+                if root_name.endswith(".lance"):
+                    root_name = root_name[: -len(".lance")]
+                normalized_repo_id = f"local/{root_name}"
+                logging.info(
+                    "repo-id '%s' does not include namespace/name, normalized to '%s'",
+                    repo_id,
+                    normalized_repo_id,
+                )
+                repo_id = normalized_repo_id
+
+            if not load_from_hf_hub and is_lance_root(root):
+                logging.info("detected lance root at %s; using runtime dir %s", root, runtime_dir)
+                dataset = LanceDataset(repo_id=repo_id, root=root, runtime_dir=runtime_dir)
+                if _env_bool("LANCE_PREENCODE_ALL", False):
+
+                    def _bg_encode():
+                        for ep_i in range(dataset.num_episodes):
+                            try:
+                                dataset._preload_videos(ep_i)
+                            except Exception:
+                                logging.warning(
+                                    "background video materialization failed ep=%d",
+                                    ep_i,
+                                    exc_info=True,
+                                )
+                        logging.info(
+                            "background video materialization complete (%d episodes)",
+                            dataset.num_episodes,
+                        )
+
+                    threading.Thread(target=_bg_encode, daemon=True).start()
+                else:
+                    logging.info("Lance full-dataset video pre-materialization disabled (LANCE_PREENCODE_ALL=false)")
             else:
-                logging.info("Lance full-dataset video pre-materialization disabled (LANCE_PREENCODE_ALL=false)")
-        else:
-            dataset = (
-                LeRobotDataset(repo_id, root=root, tolerance_s=tolerance_s)
-                if not load_from_hf_hub
-                else get_dataset_info(repo_id)
+                dataset = (
+                    LeRobotDataset(repo_id, root=root, tolerance_s=args.tolerance_s)
+                    if not load_from_hf_hub
+                    else get_dataset_info(repo_id)
+                )
+            ns, name = split_repo_id(dataset.repo_id)
+            registry.pin(
+                ns=ns,
+                name=name,
+                obj=dataset,
+                annotation_dir=_annotation_dir_for_local_dataset(dataset),
             )
+            initial_repo_id = dataset.repo_id
 
-    visualize_dataset_html(dataset, **kwargs)
+    visualize_dataset_html(
+        registry=registry,
+        episodes=args.episodes,
+        output_dir=output_dir,
+        serve=bool(args.serve),
+        host=args.host,
+        port=args.port,
+        force_override=bool(args.force_override),
+        enable_3darm=enable_3darm,
+        initial_repo_id=initial_repo_id,
+        bos_prefix=bos_prefix,
+        sync=sync,
+        auto_saver=auto_saver,
+    )
 
 
 if __name__ == "__main__":

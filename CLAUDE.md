@@ -2,11 +2,13 @@
 
 本文件用于帮助 AI 助手快速理解 Scribe 的结构、运行方式与当前开发状态。
 
-最后更新：2026-04-27
+最后更新：2026-06-14
 
-当前版本：v0.2.0
+当前版本：v0.3.0
 
-v0.2.0 主线：Lance 数据集可视化适配与性能优化。该版本已经支持本地 `.lance` episode/episode 目录进入 Scribe 的可视化界面，并完成三路相机 H264 GOP blob 到 MP4 的按需 materialize、row-to-video-frame seek 映射、原始机械臂行数据同步展示。Lance 数据集上的标注流程尚未完成专项测试，下一版本再做 Lance 标注适配和验证。
+v0.3.0 主线：**BOS / S3 在线可视化（landing 模式）**。给一个对象存储前缀（`--bos-prefix`），Scribe 列出其下所有 Lance 数据集形成登录页，点击后按需打开；机械臂列和相机 GOP blob 通过 Lance object_store 直接从 BOS 流式读取，标注 sidecar 打开时拉到本地、编辑落本地、再自动回写 BOS。新增 `bos_discovery.py` / `dataset_registry.py` / `bos_sync.py` / `templates/landing.html` 与 `scripts/run_bos.sh`。详见 §5.3。单用户 MVP，无多用户冲突检测。
+
+v0.2.0 主线：Lance 数据集可视化适配与性能优化。已支持本地 `.lance` episode/episode 目录进入可视化界面，完成三路相机 H264 GOP blob 到 MP4 的按需 materialize、row-to-video-frame seek 映射、原始机械臂行数据同步展示。Lance 数据集上的标注流程尚未完成专项测试。
 
 ---
 
@@ -40,7 +42,15 @@ v0.2.0 主线：Lance 数据集可视化适配与性能优化。该版本已经�
 
 ```bash
 scripts/download_vendor.sh   # 首次或 vendor 缺失时执行一次
-scripts/run.sh
+scripts/run.sh               # 本地单数据集（--root）
+```
+
+BOS / S3 在线浏览（先在 shell 里 export AWS_* 凭据，再运行；详见 §5.3）：
+
+```bash
+export AWS_ENDPOINT_URL=https://s3.bj.bcebos.com
+export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...  AWS_DEFAULT_REGION=bj
+bash scripts/run_bos.sh      # 只改脚本顶部 BOS_PREFIX 一行
 ```
 
 3D 开关：
@@ -75,14 +85,16 @@ python -m scribe \
 ## 3) 总体架构图
 
 ```text
-scripts/run.sh
+scripts/run.sh (本地)  |  scripts/run_bos.sh (BOS)
    └─ python -m scribe
       └─ __main__.py → app.main()
          ├─ argparse 解析参数
-         ├─ 构造 dataset:
-         │  ├─ 本地: LeRobotDataset(repo_id, root=...)
-         │  ├─ Lance: LanceDataset(repo_id, root=..., runtime_dir=...)
-         │  └─ Hub:  data.get_dataset_info(repo_id) → IterableNamespace
+         ├─ 构造 DatasetRegistry（进程级注册表 + LRU）
+         ├─ 数据源分支:
+         │  ├─ --root 本地:  pin LeRobotDataset / LanceDataset(root=本地路径)
+         │  ├─ --repo-id Hub: pin get_dataset_info(repo_id) → IterableNamespace
+         │  └─ --bos-prefix:  BosSync + AutoSaver；登录页按需
+         │                    LanceDataset(root=bos://...) 由 registry 懒加载
          └─ app.visualize_dataset_html(...)
             ├─ 准备 output_dir/static + robot/vendor 资源
             └─ routes.run_server(...)
@@ -131,6 +143,14 @@ scripts/run.sh
 |------|------|------|
 | `/<ns>/<name>/api/task-annotation-config` | GET | 读取任务模板配置 |
 
+### BOS / 同步 API（仅 landing 模式）
+
+| 路由 | 方法 | 说明 |
+|------|------|------|
+| `/api/bos/refresh` | POST | 清除发现缓存、刷新数据集列表 |
+| `/<ns>/<name>/api/sync-now` | POST | 立即 push 该数据集标注到 BOS（`force=True`） |
+| `/<ns>/<name>/api/sync-status` | GET | 查询该数据集同步状态 |
+
 ## 5) 关键文件与职责
 
 ### 后端（`scribe/` 包）
@@ -138,17 +158,22 @@ scripts/run.sh
 - **`app.py`** — 应用入口：CLI 参数解析、资源准备（vendor/robot assets）、`main()` 和 `visualize_dataset_html()` 入口函数
 - **`routes.py`** — Flask 路由：所有页面和 API 路由处理函数、标注上下文构建、`run_server()` 创建 Flask app
 - **`data.py`** — 数据层：episode 数据加载、LRU 缓存、CSV 生成（Dygraph）、时间戳、视频路径
-- **`lance_backend.py`** — Lance 数据适配：episode 发现、非 blob 列读取、H264 GOP copy remux、MP4 内部帧号映射、视频缓存
+- **`lance_backend.py`** — Lance 数据适配：episode 发现、非 blob 列读取、H264 GOP copy remux、MP4 内部帧号映射、视频缓存；支持 `bos://` / `s3://` URI 直读
+- **`bos_discovery.py`** — BOS/S3 前缀下 Lance 数据集发现：识别 `merged` / `raw_episodes` 两种形态，60s 进程内缓存
+- **`dataset_registry.py`** — 进程级数据集注册表：pinned（本地/Hub）+ on-demand（BOS 懒加载）、LRU 驱逐、slug 冲突消歧、标注上下文路由
+- **`bos_sync.py`** — 标注 sidecar 的 BOS pull/push 桥接 + `AutoSaver` 后台周期回写；本地缓存槽 `<output_dir>/bos_annotation_cache/<ns>__<name>/`
 - **`annotation_store.py`** — 标注存储：Sidecar 标注数据的完整 CRUD + 校验逻辑、任务模板解析
 - **`export.py`** — 离线导出：消费 `segment_annotations.json`，产出训练工件（clip_manifest、progress parquet、stage_priors）
 
 ### 前端
 
 - **`scribe/templates/visualize.html`** — Alpine.js 状态机驱动的主界面
+- **`scribe/templates/landing.html`** — BOS 数据集选择登录页
 
 ### 脚本（`scripts/`）
 
-- **`scripts/run.sh`** — 启动脚本（runtime 目录、HF 缓存、ARM3D 开关）
+- **`scripts/run.sh`** — 本地单数据集启动脚本（`--root`；runtime 目录、HF 缓存、ARM3D 开关）
+- **`scripts/run_bos.sh`** — BOS / S3 landing 模式启动脚本（`--bos-prefix`；凭据走 `AWS_*` 环境变量，不硬编码）
 - **`scripts/download_vendor.sh`** — 下载前端依赖到 `scribe/vendor/`
 - **`scripts/install_pylance.sh`** — 从 `fecet/lance` 固定 commit 编译安装带 `Blob` / `blob_array` 支持的 pylance；源码 clone 到本地 `.lance-src/`
 
@@ -244,6 +269,40 @@ pixi run check
 - 当前 episode 首次打开仍要等待视频生成完成。
 - 超长 episode 的 CSV payload 仍可能较大，后续可改为分块数据接口。
 
+## 5.3) v0.3.0 BOS / S3 landing 实现方案
+
+### 启动与装配（app.py）
+
+- `--bos-prefix bos://.../`（或 `s3://`）进入 landing 模式，与 `--root` / `--repo-id` / `--load-from-hf-hub` **互斥**（`main()` 里硬校验，违反则 `SystemExit`）。
+- landing 模式下构造：`BosSync(local_cache_root=output_dir/"bos_annotation_cache")`、`DatasetRegistry(runtime_dir, sync, max_size=SCRIBE_DATASET_LRU)`、`AutoSaver(sync, interval_s=--autosave-interval-s)` 并 `start()`。
+
+### 数据发现（bos_discovery.py）
+
+- `list_bos_datasets(prefix)`：对前缀 `ls`，识别两种形态——`merged`（`<name>.lance`）、`raw_episodes`（含 `episode_*.lance` 的目录，多花 1 次 `ls` 数 episode）。
+- scheme 桥接：`bos://` → `s3://` 仅在交给 fsspec/s3fs 时改写（`_to_fsspec_uri`），endpoint 由 `AWS_ENDPOINT_URL` 决定；返回给 Lance 的 URI 保留原 scheme。
+- `list_bos_datasets_cached` 60s 进程内 memo，`/api/bos/refresh` 触发 `invalidate_cache`。
+
+### 数据集注册表（dataset_registry.py）
+
+- 两类登记：**pinned**（本地/Hub，进程启动即载，永不驱逐）、**on-demand**（BOS landing，`get()` 首次命中时 `LanceDataset(root=bos://...)` 懒构造）。
+- LRU 默认 `SCRIBE_DATASET_LRU=3`；驱逐 `_on_eviction` 会 `sync.push` 但**保留 sync 槽**（避免重置 `last_pulled_at` 把未同步的本地标注覆盖回旧 BOS 字节）。
+- `register_remote_batch` 对 `derive_slug` 撞名的不同 URI 追加 8 位 URI hash 消歧，避免两行 landing 指向同一槽。
+- `annotation_context()`：remote 数据集的标注路径指向本地 sync 缓存槽，CRUD 仍是纯 `pathlib` 本地写。
+
+### 标注同步（bos_sync.py）
+
+- `pull`：dataset 打开时把 `<uri>/annotations/` 镜像到本地槽，**一次**；之后 CRUD 只动本地。`last_pulled_at` 非空且非 force 时为 no-op，防止 LRU 来回切换时丢未保存编辑。
+- `push`：由 Save / `AutoSaver`（默认 60s）/ LRU 驱逐 / 进程退出（`atexit`）触发。race-safe：上传前先清 dirty 位，失败再置回重试。
+- `_check_remote_changed_since` 是 stub（恒 False，直接覆盖）——**单用户 MVP**，多用户冲突检测留作未来插入点。
+- 缓存槽布局：`<local_cache_root>/<ns>__<name>/annotations/{episode_curation.json, segment_annotations.json, frame_events.jsonl, task_annotation_config.json}`。
+
+### v0.3.0 边界 / 风险
+
+- 单用户 MVP，无多用户并发冲突保护。
+- 远程模式首次打开 episode 仍需从 BOS 拉 GOP blob 并 materialize，首帧延迟比本地高。
+- 凭据走 `AWS_*` 环境变量；**禁止把 AK/SK 硬编码进 `scripts/run_bos.sh` 并提交**。
+- Lance 标注链路整体仍待专项验证（沿用 §5.2 v0.2.0 边界）。
+
 ## 6) 标注系统数据架构
 
 ### Sidecar 原则
@@ -323,9 +382,11 @@ python -m scribe.export \
 - Lance 当前 episode 首次打开仍会等待该 episode 的 MP4 materialize；默认只关闭全量预生成，不跳过当前 episode 生成
 - H264 copy remux 失败时会 fallback 到 intra-frame encode，文件会更大、耗时更高
 - `requestVideoFrameCallback` 不可用的浏览器会回退到 `timeupdate`，播放同步粒度较粗
-- 标注 API 仅支持本地 `--root` 数据集，Hub 模式下标注功能 disabled
+- 标注 API 支持本地 `--root` 数据集与 BOS landing 数据集；Hub 模式下标注功能 disabled
 - 缓存默认 16 个 episode，大维度数据集需关注内存
 - 标注文件写入用线程锁保护，仅限单进程安全
+- BOS landing 为单用户 MVP：`bos_sync._check_remote_changed_since` 恒 False，多人同时标注同一数据集会互相覆盖
+- BOS 凭据走 `AWS_*` 环境变量，切勿把 AK/SK 硬编码进 `scripts/run_bos.sh` 提交
 
 ## 10) 恢复开发状态检查清单
 

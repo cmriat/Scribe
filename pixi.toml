@@ -23,6 +23,12 @@ rerun-sdk = "0.21.0.*"
 dill = "<0.3.9"
 casadi = "*"
 ruff = ">=0.11,<1"
+# BOS / S3 access for the landing page. Lance's object_store opens URIs natively
+# but `fsspec.ls` / `fsspec.exists` (used by bos_discovery + bos_sync) need an
+# explicit filesystem class for the s3 protocol. Version pinned to the same
+# release line as the conda-installed fsspec to avoid solver conflicts with
+# lerobot's transitive `datasets` constraint.
+s3fs = "==2025.3.0"
 
 [pypi-dependencies]
 # lerobot

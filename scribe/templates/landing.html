@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scribe · BOS Datasets</title>
+    <script src="/static/{{ vendor_assets.tailwind_js }}"></script>
+    <script src="/static/{{ vendor_assets.alpine_js }}" defer></script>
+</head>
+<body class="min-h-screen bg-zinc-950 text-zinc-200 font-sans">
+    <div class="max-w-5xl mx-auto px-6 py-10"
+         x-data="landingData()" x-init="init()">
+        <header class="flex items-baseline justify-between gap-4 mb-6">
+            <div>
+                <h1 class="text-2xl font-semibold tracking-tight">Scribe — Pick a dataset</h1>
+                <p class="mt-1 text-sm text-zinc-400">
+                    Browsing <span class="font-mono text-zinc-300">{{ bos_prefix }}</span>
+                    · listing refresh every <span x-text="cacheTtl"></span>s
+                </p>
+            </div>
+            <button @click="refresh()"
+                    :disabled="refreshing"
+                    class="px-3 py-1.5 text-sm rounded border border-zinc-700 hover:bg-zinc-800 disabled:opacity-50">
+                <span x-show="!refreshing">Refresh</span>
+                <span x-show="refreshing">Refreshing…</span>
+            </button>
+        </header>
+
+        {% if error %}
+        <div class="mb-6 p-4 rounded border border-red-700 bg-red-950/40 text-red-200">
+            <p class="font-semibold">Listing failed</p>
+            <pre class="mt-2 text-xs whitespace-pre-wrap">{{ error }}</pre>
+            <p class="mt-2 text-xs text-red-300">
+                Check that AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_ENDPOINT_URL
+                are set and the prefix exists.
+            </p>
+        </div>
+        {% endif %}
+
+        {% if pinned %}
+        <section class="mb-8">
+            <h2 class="text-sm font-semibold text-zinc-300 uppercase tracking-wider mb-2">
+                Pinned (local)
+            </h2>
+            <ul class="divide-y divide-zinc-800 border border-zinc-800 rounded">
+                {% for row in pinned %}
+                <li class="px-4 py-2.5 flex items-center justify-between">
+                    <div>
+                        <p class="font-mono text-sm">{{ row.ns }}/{{ row.name }}</p>
+                        {% if row.episode_count is not none %}
+                        <p class="text-xs text-zinc-500">{{ row.episode_count }} episodes</p>
+                        {% endif %}
+                    </div>
+                    <a href="{{ row.open_url }}"
+                       class="px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600">Open</a>
+                </li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
+
+        <section>
+            <h2 class="text-sm font-semibold text-zinc-300 uppercase tracking-wider mb-2">
+                BOS datasets ({{ discovered|length }})
+            </h2>
+            {% if discovered %}
+            <ul class="divide-y divide-zinc-800 border border-zinc-800 rounded">
+                {% for row in discovered %}
+                <li class="px-4 py-3 flex items-center justify-between gap-4">
+                    <div class="min-w-0 flex-1">
+                        <p class="font-mono text-sm truncate" title="{{ row.uri }}">{{ row.display_name }}</p>
+                        <p class="text-xs text-zinc-500 mt-0.5">
+                            <span class="inline-block px-1.5 py-0.5 rounded
+                                {% if row.form == 'merged' %}bg-blue-900/40 text-blue-300{% else %}bg-amber-900/40 text-amber-300{% endif %}">
+                                {{ row.form }}
+                            </span>
+                            {% if row.episode_count is not none %}
+                            <span class="ml-2">{{ row.episode_count }} episodes</span>
+                            {% endif %}
+                            <span class="ml-2 text-zinc-600 break-all">{{ row.uri }}</span>
+                        </p>
+                    </div>
+                    <a href="{{ row.open_url }}"
+                       class="shrink-0 px-3 py-1 text-sm rounded bg-emerald-700 hover:bg-emerald-600">Open</a>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p class="px-4 py-6 text-sm text-zinc-500 border border-dashed border-zinc-800 rounded">
+                No datasets found under this prefix.
+                Confirm the BOS path and that <span class="font-mono">.lance</span> directories
+                (or <span class="font-mono">episode_*.lance</span> children) are present.
+            </p>
+            {% endif %}
+        </section>
+
+        <footer class="mt-10 text-xs text-zinc-600">
+            Scribe BOS landing · listings cached for <span x-text="cacheTtl"></span>s.
+            Click Refresh to force an immediate <code>ls</code> against BOS.
+        </footer>
+    </div>
+
+    <script>
+        function landingData() {
+            return {
+                cacheTtl: {{ cache_ttl_s | int }},
+                refreshing: false,
+                init() {},
+                async refresh() {
+                    if (this.refreshing) return;
+                    this.refreshing = true;
+                    try {
+                        const response = await fetch('/api/bos/refresh', {method: 'POST'});
+                        if (!response.ok) {
+                            throw new Error(`refresh failed (${response.status})`);
+                        }
+                        window.location.reload();
+                    } catch (err) {
+                        alert(`Refresh failed: ${err.message}`);
+                        this.refreshing = false;
+                    }
+                },
+            };
+        }
+    </script>
+</body>
+</html>

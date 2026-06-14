@@ -81,8 +81,12 @@ _episode_timestamp_cache_lock = Lock()
 def _get_dataset_cache_key(dataset: LeRobotDataset | IterableNamespace) -> str:
     repo_id = getattr(dataset, "repo_id", "")
     if isinstance(dataset, LOCAL_DATASET_TYPES):
-        root = str(dataset.root.resolve())
-        return f"local:{root}:{repo_id}"
+        # LanceDataset.root may be a bos:// / s3:// URI string, so we route
+        # through `root_id` (a portable str) instead of assuming a Path.
+        root_id = getattr(dataset, "root_id", None)
+        if root_id is None:
+            root_id = str(dataset.root.resolve())  # LeRobotDataset (always local Path)
+        return f"local:{root_id}:{repo_id}"
     return f"hub:{repo_id}"
 
 

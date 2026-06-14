@@ -10,7 +10,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import yaml
-
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 logger = logging.getLogger(__name__)
@@ -71,13 +70,13 @@ DEFAULT_TASK_ANNOTATION_STORE = {
                         "place_folded_garment",
                     ],
                     "stage_metadata": {
-                        "prepare_on_table":     {"title": "放到桌面准备整理", "color": "#0ea5e9"},
-                        "flatten_for_folding":  {"title": "展平到可折叠状态", "color": "#10b981"},
-                        "fold_near_sleeve":     {"title": "折叠近侧衣袖",     "color": "#3b82f6"},
-                        "fold_far_sleeve":      {"title": "折叠远侧衣袖",     "color": "#6366f1"},
-                        "fold_body_half":       {"title": "整体第一次对折",   "color": "#8b5cf6"},
-                        "fold_body_compact":    {"title": "整体第二次对折",   "color": "#a855f7"},
-                        "place_folded_garment": {"title": "放到目标位置",     "color": "#22c55e"},
+                        "prepare_on_table": {"title": "放到桌面准备整理", "color": "#0ea5e9"},
+                        "flatten_for_folding": {"title": "展平到可折叠状态", "color": "#10b981"},
+                        "fold_near_sleeve": {"title": "折叠近侧衣袖", "color": "#3b82f6"},
+                        "fold_far_sleeve": {"title": "折叠远侧衣袖", "color": "#6366f1"},
+                        "fold_body_half": {"title": "整体第一次对折", "color": "#8b5cf6"},
+                        "fold_body_compact": {"title": "整体第二次对折", "color": "#a855f7"},
+                        "place_folded_garment": {"title": "放到目标位置", "color": "#22c55e"},
                     },
                 },
                 "flatten_internal": {
@@ -88,7 +87,7 @@ DEFAULT_TASK_ANNOTATION_STORE = {
                     "stage_order": ["coarse_adjust", "local_refine"],
                     "stage_metadata": {
                         "coarse_adjust": {"title": "粗粒度调整", "color": "#f59e0b"},
-                        "local_refine":  {"title": "局部微调",   "color": "#ec4899"},
+                        "local_refine": {"title": "局部微调", "color": "#ec4899"},
                     },
                 },
             },
@@ -102,31 +101,36 @@ def _slugify_text(value: str) -> str:
     return normalized or "custom"
 
 
-def build_local_annotation_context(
-    dataset_obj,
-    repo_id: str,
+def build_annotation_context_from_dir(
+    annotations_dir: Path,
+    *,
+    dataset_id: str,
+    dataset_root: str | None,
 ) -> dict[str, Any]:
-    # Both LeRobotDataset and LanceDataset expose a `.root` Path whose parent
-    # houses the annotations/ sidecar directory. Hub (IterableNamespace) has no
-    # root and annotations stay disabled.
-    from scribe.lance_backend import LanceDataset  # local import avoids cycles
+    """Build the standard annotation context dict from an explicit sidecar dir.
 
-    if isinstance(dataset_obj, (LeRobotDataset, LanceDataset)):
-        dataset_root = dataset_obj.root.resolve()
-        annotations_dir = dataset_root / ANNOTATIONS_DIRNAME
-        return {
-            "enabled": True,
-            "dataset_id": dataset_root.as_posix(),
-            "dataset_root": dataset_root.as_posix(),
-            "annotations_dir": annotations_dir.as_posix(),
-            "files": {
-                "episode_curation": (annotations_dir / EPISODE_CURATION_FILENAME).as_posix(),
-                "segment_annotations": (annotations_dir / SEGMENT_ANNOTATIONS_FILENAME).as_posix(),
-                "frame_events": (annotations_dir / FRAME_EVENTS_FILENAME).as_posix(),
-                "task_config": (annotations_dir / TASK_ANNOTATION_CONFIG_FILENAME).as_posix(),
-            },
-        }
+    Use this directly from the BOS landing flow, where the sidecar dir lives in
+    the local runtime cache (not under ``dataset.root``). ``dataset_id`` is the
+    stable identifier used inside the JSON payloads (URI for BOS, posix path
+    for local); ``dataset_root`` is purely informational and can be None for
+    URI-rooted datasets.
+    """
+    annotations_dir = Path(annotations_dir)
+    return {
+        "enabled": True,
+        "dataset_id": dataset_id,
+        "dataset_root": dataset_root,
+        "annotations_dir": annotations_dir.as_posix(),
+        "files": {
+            "episode_curation": (annotations_dir / EPISODE_CURATION_FILENAME).as_posix(),
+            "segment_annotations": (annotations_dir / SEGMENT_ANNOTATIONS_FILENAME).as_posix(),
+            "frame_events": (annotations_dir / FRAME_EVENTS_FILENAME).as_posix(),
+            "task_config": (annotations_dir / TASK_ANNOTATION_CONFIG_FILENAME).as_posix(),
+        },
+    }
 
+
+def disabled_annotation_context(repo_id: str) -> dict[str, Any]:
     return {
         "enabled": False,
         "dataset_id": repo_id,
@@ -139,6 +143,32 @@ def build_local_annotation_context(
             "task_config": None,
         },
     }
+
+
+def build_local_annotation_context(
+    dataset_obj,
+    repo_id: str,
+) -> dict[str, Any]:
+    """Local-only convenience: sidecar dir is ``<dataset_root>/annotations``.
+
+    Hub datasets and any remote LanceDataset (``root_is_remote=True``) return
+    the disabled context. Remote datasets get their context built via
+    ``build_annotation_context_from_dir`` from the BOS sync layer, which knows
+    the local cache path.
+    """
+    from scribe.lance_backend import LanceDataset  # local import avoids cycles
+
+    if isinstance(dataset_obj, (LeRobotDataset, LanceDataset)):
+        if getattr(dataset_obj, "root_is_remote", False):
+            return disabled_annotation_context(repo_id)
+        dataset_root = dataset_obj.root.resolve()
+        return build_annotation_context_from_dir(
+            dataset_root / ANNOTATIONS_DIRNAME,
+            dataset_id=dataset_root.as_posix(),
+            dataset_root=dataset_root.as_posix(),
+        )
+
+    return disabled_annotation_context(repo_id)
 
 
 def _default_episode_curation_store(dataset_id: str) -> dict[str, Any]:
@@ -209,9 +239,9 @@ def default_task_annotation_store(dataset_id: str) -> dict[str, Any]:
 
 def load_task_annotation_store(storage_path: Path, dataset_id: str) -> dict[str, Any]:
     """Three-tier resolution:
-       1. <annotations_dir>/task_annotation_config.yaml  (per-dataset override; preferred)
-       2. <annotations_dir>/task_annotation_config.json  (runtime mutations from frontend)
-       3. builtin (scribe/configs/default_task.yaml -> DEFAULT_TASK_ANNOTATION_STORE)
+    1. <annotations_dir>/task_annotation_config.yaml  (per-dataset override; preferred)
+    2. <annotations_dir>/task_annotation_config.json  (runtime mutations from frontend)
+    3. builtin (scribe/configs/default_task.yaml -> DEFAULT_TASK_ANNOTATION_STORE)
     """
     default_store = default_task_annotation_store(dataset_id)
 
@@ -228,7 +258,11 @@ def load_task_annotation_store(storage_path: Path, dataset_id: str) -> dict[str,
             pass
 
     # Prefer dataset YAML; fallback to JSON; fallback to builtin
-    content = yaml_content if (yaml_content and isinstance(yaml_content.get("tasks"), dict) and yaml_content["tasks"]) else json_content
+    content = (
+        yaml_content
+        if (yaml_content and isinstance(yaml_content.get("tasks"), dict) and yaml_content["tasks"])
+        else json_content
+    )
 
     if content is None:
         return default_store

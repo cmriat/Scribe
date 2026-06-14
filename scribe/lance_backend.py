@@ -19,6 +19,7 @@ Design:
 from __future__ import annotations
 
 import os
+import re
 import sys
 import shutil
 import hashlib
@@ -62,6 +63,76 @@ FFPROBE_BIN = _find_bin("ffprobe")
 LANCE_SUFFIX = ".lance"
 CAMERA_KEYS_DEFAULT = ("mid", "left", "right")
 
+
+# ---------------------------------------------------------------------------
+# URI helpers — dual-mode (local path / bos:// / s3://). Mirrors the pattern
+# used in airbot_play_ws/scripts/build_training_lance.py; intentionally copied
+# rather than shared to keep Scribe self-contained.
+# ---------------------------------------------------------------------------
+
+LanceRoot = "Path | str"  # documentation only; runtime accepts either
+
+
+def _is_remote_uri(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(("s3://", "bos://"))
+
+
+def _lance_uri(root) -> str:
+    """Return a string that Lance's object_store can open.
+
+    Lance's object_store registers schemes ``s3 / s3+ddb / gs / az / abfss /
+    cos / oss / hf / file / memory`` — ``bos`` is not one of them, even though
+    BOS is S3-compatible. We rewrite ``bos://`` to ``s3://``; the actual
+    endpoint is taken from ``AWS_ENDPOINT_URL`` (pointed at BOS) so the
+    network request still hits the right service. For local paths we just
+    stringify.
+    """
+    if _is_remote_uri(root):
+        return "s3://" + root[len("bos://") :] if root.startswith("bos://") else root
+    return str(root)
+
+
+def _root_str(root) -> str:
+    """Stringify a root that may be a Path or a URI."""
+    return root if isinstance(root, str) else str(root)
+
+
+def _root_basename(root) -> str:
+    """Last URI segment / Path name, with any trailing slash stripped."""
+    s = _root_str(root).rstrip("/")
+    return s.rsplit("/", 1)[-1] if "/" in s else s
+
+
+def _root_normalize(root):
+    """Resolve a local path; leave a URI untouched (after stripping trailing /)."""
+    if _is_remote_uri(root):
+        return root.rstrip("/")
+    return Path(root).resolve()
+
+
+def _root_versions_present(root) -> bool:
+    """True if root looks like a Lance dataset (has a ``_versions/`` subdir).
+
+    For URIs we go through fsspec; the call is one HEAD/LIST and fails closed
+    (returns False) on any error so the caller can fall back to per-episode
+    discovery.
+    """
+    if _is_remote_uri(root):
+        try:
+            import fsspec
+
+            # Route bos:// through s3:// for s3fs's URL parser; see
+            # bos_discovery._to_fsspec_uri for the rationale.
+            fsspec_uri = "s3://" + root[len("bos://") :] if root.startswith("bos://") else root
+            fs, fs_path = fsspec.core.url_to_fs(fsspec_uri)
+            return bool(fs.exists(fs_path.rstrip("/") + "/_versions"))
+        except (OSError, FileNotFoundError, PermissionError) as exc:
+            logger.debug("URI _versions probe failed for %s: %s", root, exc)
+            return False
+    p = Path(root)
+    return p.is_dir() and (p / "_versions").exists()
+
+
 # Cache namespace policy slugs. Coexist on disk so switching policies doesn't
 # clobber prior caches (rollback-safe).
 #   copy     — `-c:v copy` remux. Preserves source bitrate (fast, same size as source).
@@ -71,7 +142,7 @@ CAMERA_KEYS_DEFAULT = ("mid", "left", "right")
 #              + no CRF (high source bitrate). Falls back to copy on validation
 #              failure so frame mapping is never silently broken.
 _VIDEO_CACHE_VERSIONS = {
-    "copy":     "h264copy_v1",
+    "copy": "h264copy_v1",
     "reencode": "h264reencode_crf23_v1",
 }
 # Default = copy (matches §5.1 invariant). HIL / slow-network users opt in via
@@ -87,7 +158,9 @@ def _video_policy() -> str:
     if raw not in _VIDEO_CACHE_VERSIONS:
         logger.warning(
             "unknown LANCE_VIDEO_POLICY=%r (allowed: %s); using %s",
-            raw, sorted(_VIDEO_CACHE_VERSIONS), _DEFAULT_VIDEO_POLICY,
+            raw,
+            sorted(_VIDEO_CACHE_VERSIONS),
+            _DEFAULT_VIDEO_POLICY,
         )
         return _DEFAULT_VIDEO_POLICY
     return raw
@@ -103,17 +176,24 @@ class _GopLayout:
     video_frame_indices: np.ndarray
 
 
-def _dataset_runtime_namespace(root: Path, repo_id: str) -> str:
+def _dataset_runtime_namespace(root, repo_id: str) -> str:
     """Build a stable, filesystem-safe runtime namespace for one lance dataset.
 
     The trailing slug is the *current policy's* cache version, so MP4s from
     `copy` and `reencode` policies live in distinct directories — no collision,
     no half-mixed cache.
+
+    ``root`` may be a local ``Path`` or a ``bos://`` / ``s3://`` URI; both are
+    hashed in their canonical (normalised) form so two callers passing the
+    same dataset by different surface representations still land in the same
+    runtime namespace.
     """
-    root = Path(root).resolve()
-    stem = root.stem if root.suffix == LANCE_SUFFIX else root.name
+    canonical = _root_normalize(root)
+    canonical_str = _root_str(canonical)
+    name = _root_basename(canonical_str)
+    stem = name[: -len(LANCE_SUFFIX)] if name.endswith(LANCE_SUFFIX) else name
     slug = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem).strip("_") or "dataset"
-    digest = hashlib.sha1(f"{root}|{repo_id}".encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha1(f"{canonical_str}|{repo_id}".encode("utf-8")).hexdigest()[:12]
     return f"{slug}_{digest}_{_video_cache_version()}"
 
 
@@ -124,13 +204,21 @@ def _ffprobe_frame_count(path: Path) -> int | None:
     try:
         r = subprocess.run(
             [
-                FFPROBE_BIN, "-v", "error", "-count_frames",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=nb_read_frames",
-                "-of", "default=nokey=1:noprint_wrappers=1",
+                FFPROBE_BIN,
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "default=nokey=1:noprint_wrappers=1",
                 str(path),
             ],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
         if r.returncode != 0:
             return None
@@ -182,9 +270,7 @@ FEATURE_SOURCE = {
 # (used by FEATURE_SOURCE and the rest of this module) back to actual schema
 # columns at read time.
 
-LANCE_MERGED_SIGNATURE_COLS = frozenset(
-    {"action", "observation_state", "episode_index"}
-)
+LANCE_MERGED_SIGNATURE_COLS = frozenset({"action", "observation_state", "episode_index"})
 
 # Required logical scalar columns for a viable Lance episode (raw OR merged).
 # Used to fail loudly at construction if a column is missing — replaces the
@@ -278,6 +364,7 @@ def _split_episodes_by_index(ds: lance.LanceDataset) -> list[tuple[int, int, int
     # contiguous run per episode_index is the only assumption that holds.
     if len(ids) != len(set(ids)):
         from collections import Counter
+
         repeats = [k for k, v in Counter(ids).items() if v > 1]
         raise RuntimeError(
             f"merged .lance has interleaved episode_index column: episode "
@@ -295,9 +382,15 @@ def _split_episodes_by_index(ds: lance.LanceDataset) -> list[tuple[int, int, int
 # -----------------------------------------------------------------------------
 
 
-def is_lance_root(path: Path | str | None) -> bool:
-    """True if `path` is a `.lance` directory or a dir containing episode_*.lance."""
-    if path is None:
+def is_lance_root(path) -> bool:
+    """True if `path` is a `.lance` directory or a dir containing episode_*.lance.
+
+    Local-only. URI mode is handled by the caller in ``app.py``, which already
+    knows the dataset is on BOS because the user passed ``--bos-prefix``; we
+    keep this helper Path-only to avoid surprising network traffic during
+    Scribe's CLI argument parsing.
+    """
+    if path is None or _is_remote_uri(path):
         return False
     p = Path(path)
     if not p.exists() or not p.is_dir():
@@ -313,8 +406,22 @@ def is_lance_root(path: Path | str | None) -> bool:
     return False
 
 
-def discover_lance_episodes(root: Path) -> list[Path]:
-    """Return episode `.lance` directories in a stable sorted order."""
+def discover_lance_episodes(root) -> list:
+    """Return episode `.lance` entries (Path or URI str) in stable sorted order.
+
+    Three shapes are supported:
+
+    * local ``Path`` ending in ``.lance``      → return ``[root]``
+    * local directory of ``episode_*.lance``   → return sorted ``Path`` list
+    * ``bos://``/``s3://`` URI in either form → return sorted ``str`` list
+
+    Per the team convention the raw-per-episode form is matched **only** as
+    ``episode_<digits>.lance`` (the merge pipeline names episodes this way and
+    other prefixes belong to merged outputs whose top-level is already a single
+    ``.lance``).
+    """
+    if _is_remote_uri(root):
+        return _discover_episodes_remote(root)
     root = Path(root)
     if root.suffix == LANCE_SUFFIX:
         return [root]
@@ -323,6 +430,34 @@ def discover_lance_episodes(root: Path) -> list[Path]:
         key=lambda p: p.name,
     )
     return children
+
+
+_EPISODE_LANCE_RE = re.compile(r"^episode_\d+\.lance$")
+
+
+def _discover_episodes_remote(root: str) -> list[str]:
+    root = root.rstrip("/")
+    # Single merged .lance? `discover` returns just it so downstream code can
+    # treat the result uniformly. LanceDataset still calls _is_merged_lance
+    # afterwards to decide between merged-view vs per-episode handling.
+    name = _root_basename(root)
+    if name.endswith(LANCE_SUFFIX):
+        return [root]
+
+    import fsspec
+
+    scheme = root.split("://", 1)[0]
+    # s3fs's URL parser doesn't recognise bos://; rewrite for the fsspec call
+    # while keeping the original scheme on the returned URIs (Lance accepts both).
+    fsspec_uri = "s3://" + root[len("bos://") :] if root.startswith("bos://") else root
+    fs, fs_path = fsspec.core.url_to_fs(fsspec_uri)
+    matched: list[str] = []
+    for entry in fs.ls(fs_path, detail=False):
+        ename = entry.rstrip("/").rsplit("/", 1)[-1]
+        if _EPISODE_LANCE_RE.match(ename):
+            matched.append(f"{scheme}://{entry.rstrip('/')}")
+    matched.sort(key=lambda s: s.rsplit("/", 1)[-1])
+    return matched
 
 
 # -----------------------------------------------------------------------------
@@ -358,8 +493,14 @@ class _EpisodeLance:
         col_aliases: dict[str, str] | None = None,
     ):
         if path is not None and shared_ds is None:
-            self.path = Path(path).resolve()
-            self._ds = lance.dataset(str(self.path))
+            if _is_remote_uri(path):
+                # Keep the user-facing URI on self.path (may be bos://) but
+                # hand Lance's object_store a scheme it actually registers.
+                self.path = path.rstrip("/")
+                self._ds = lance.dataset(_lance_uri(self.path))
+            else:
+                self.path = Path(path).resolve()
+                self._ds = lance.dataset(str(self.path))
             self._row_offset = 0
             self._row_count = int(self._ds.count_rows())
             self._col_aliases: dict[str, str] = {}
@@ -391,8 +532,9 @@ class _EpisodeLance:
         self._inv_aliases: dict[str, str] = {v: k for k, v in self._col_aliases.items()}
 
     @classmethod
-    def from_path(cls, path: Path) -> "_EpisodeLance":
-        """Raw mode: one .lance file = one episode."""
+    def from_path(cls, path) -> "_EpisodeLance":
+        """Raw mode: one .lance file = one episode. ``path`` may be a local
+        ``Path`` or a ``bos://``/``s3://`` URI string."""
         return cls(path)
 
     @classmethod
@@ -436,9 +578,7 @@ class _EpisodeLance:
         if self._instruction is None:
             if "language_instruction" in {f.name for f in self._ds.schema}:
                 # Read from this episode's first row (merged view: row_offset > 0).
-                tbl = self._ds.to_table(
-                    columns=["language_instruction"], limit=1, offset=self._row_offset
-                )
+                tbl = self._ds.to_table(columns=["language_instruction"], limit=1, offset=self._row_offset)
                 self._instruction = str(tbl.column("language_instruction")[0].as_py() or "") if tbl.num_rows else ""
             else:
                 self._instruction = ""
@@ -500,12 +640,12 @@ class _EpisodeLance:
         if self._row_count == 0:
             return None, None
         actual = self._actual(column)
-        first = self._ds.to_table(
-            columns=[actual], limit=1, offset=self._row_offset
-        ).column(actual)[0].as_py()
-        last = self._ds.to_table(
-            columns=[actual], limit=1, offset=self._row_offset + self._row_count - 1
-        ).column(actual)[0].as_py()
+        first = self._ds.to_table(columns=[actual], limit=1, offset=self._row_offset).column(actual)[0].as_py()
+        last = (
+            self._ds.to_table(columns=[actual], limit=1, offset=self._row_offset + self._row_count - 1)
+            .column(actual)[0]
+            .as_py()
+        )
         return first, last
 
     def robot_fps(self) -> float:
@@ -728,9 +868,13 @@ class _LanceMeta:
 class LanceDataset:
     """Duck-typed stand-in for LeRobotDataset, backed by episode `.lance` files."""
 
-    def __init__(self, repo_id: str, root: Path, runtime_dir: Path):
+    def __init__(self, repo_id: str, root, runtime_dir: Path):
+        """``root`` is either a local ``Path`` or a ``bos://``/``s3://`` URI;
+        ``runtime_dir`` is always local (materialised MP4s + caches live on
+        local disk regardless of where the source Lance lives)."""
         self.repo_id = str(repo_id)
-        self._root = Path(root).resolve()
+        self._root = _root_normalize(root)
+        self._root_is_remote = _is_remote_uri(self._root)
         self._runtime_dir = Path(runtime_dir).resolve()
         self._video_root = self._runtime_dir / "videos" / _dataset_runtime_namespace(self._root, self.repo_id)
         self._video_root.mkdir(parents=True, exist_ok=True)
@@ -743,9 +887,10 @@ class LanceDataset:
         # Otherwise fall back to the legacy raw-per-episode discovery (one
         # .lance per file).
         self._is_merged = False
-        if self._root.is_dir() and (self._root / "_versions").exists():
+        root_lance_uri = _lance_uri(self._root)
+        if _root_versions_present(self._root):
             try:
-                root_ds = lance.dataset(str(self._root))
+                root_ds = lance.dataset(root_lance_uri)
                 if _is_merged_lance(root_ds):
                     self._is_merged = True
                     self._merged_ds = root_ds
@@ -778,20 +923,18 @@ class LanceDataset:
             if "language_instruction" in schema_names:
                 start_rows = [v._row_offset for v in self._episodes]
                 try:
-                    instr_arr = (
-                        self._merged_ds.take(start_rows, columns=["language_instruction"])
-                        ["language_instruction"].to_pylist()
-                    )
-                    for view, instr in zip(self._episodes, instr_arr):
+                    instr_arr = self._merged_ds.take(start_rows, columns=["language_instruction"])[
+                        "language_instruction"
+                    ].to_pylist()
+                    for view, instr in zip(self._episodes, instr_arr, strict=True):
                         view._instruction = str(instr or "")
                 except Exception as exc:
                     logger.warning(
-                        "LanceDataset: bulk instruction prefetch failed (%s); "
-                        "falling back to lazy per-episode reads.", exc
+                        "LanceDataset: bulk instruction prefetch failed (%s); falling back to lazy per-episode reads.",
+                        exc,
                     )
             logger.info(
-                "LanceDataset: detected merged .lance under %s; %d episodes "
-                "(episode_index range [%d..%d])",
+                "LanceDataset: detected merged .lance under %s; %d episodes (episode_index range [%d..%d])",
                 self._root,
                 len(self._episodes),
                 self._merged_episode_ids[0],
@@ -883,8 +1026,20 @@ class LanceDataset:
     # ---- Duck-typed attributes -------------------------------------------------
 
     @property
-    def root(self) -> Path:
+    def root(self):
+        """The dataset root as the caller supplied it: ``Path`` for local,
+        ``str`` (``bos://`` / ``s3://`` URI) for remote. Callers that need a
+        portable identifier should use ``root_id`` below."""
         return self._root
+
+    @property
+    def root_id(self) -> str:
+        """String form of ``root`` — safe to use as a cache key or in logs."""
+        return _root_str(self._root)
+
+    @property
+    def root_is_remote(self) -> bool:
+        return self._root_is_remote
 
     @property
     def video_root(self) -> Path:
@@ -1057,7 +1212,12 @@ class LanceDataset:
             min_required_frames = int(row_indices.max()) + 1 if row_indices.size else 0
             logger.info(
                 "LanceDataset: materialize ep=%d cam=%s fps=%.3f policy=%s min_frames=%d -> %s",
-                episode_index, cam, fps, policy, min_required_frames, out,
+                episode_index,
+                cam,
+                fps,
+                policy,
+                min_required_frames,
+                out,
             )
             tmp = out.with_suffix(".mp4.part")
             try:
@@ -1065,7 +1225,12 @@ class LanceDataset:
                 produced = False
                 if policy == "reencode":
                     produced = self._materialize_reencode(
-                        ep, cam, fps, episode_index, tmp, min_required_frames,
+                        ep,
+                        cam,
+                        fps,
+                        episode_index,
+                        tmp,
+                        min_required_frames,
                     )
                 # ── Tier 2: -c:v copy remux (fast, original bitrate) ──────────
                 # Always available as a safety fallback when reencode fails
@@ -1103,27 +1268,59 @@ class LanceDataset:
         """
         gop_size = max(1, int(round(fps)))  # ~1 keyframe/sec; aligns with ~30Hz HIL
         r = self._run_ffmpeg_with_episode_stream(
-            ep, cam,
+            ep,
+            cam,
             [
-                FFMPEG_BIN, "-y", "-loglevel", "error",
-                "-fflags", "+genpts",
-                "-f", "h264", "-framerate", f"{fps:.6f}",
-                "-i", "-",
-                "-map", "0:v:0", "-an", "-sn", "-dn",
-                "-fps_mode", "passthrough",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-bf", "0", "-g", str(gop_size), "-keyint_min", str(gop_size),
-                "-sc_threshold", "0",
-                "-video_track_timescale", "90000",
-                "-movflags", "+faststart",
-                "-f", "mp4", str(tmp),
+                FFMPEG_BIN,
+                "-y",
+                "-loglevel",
+                "error",
+                "-fflags",
+                "+genpts",
+                "-f",
+                "h264",
+                "-framerate",
+                f"{fps:.6f}",
+                "-i",
+                "-",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-fps_mode",
+                "passthrough",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-bf",
+                "0",
+                "-g",
+                str(gop_size),
+                "-keyint_min",
+                str(gop_size),
+                "-sc_threshold",
+                "0",
+                "-video_track_timescale",
+                "90000",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                str(tmp),
             ],
         )
         if r.returncode != 0:
             logger.warning(
                 "reencode failed ep=%d cam=%s: %s; will fall back to copy",
-                episode_index, cam, r.stderr.decode(errors="replace")[:500],
+                episode_index,
+                cam,
+                r.stderr.decode(errors="replace")[:500],
             )
             if tmp.exists():
                 tmp.unlink()
@@ -1133,14 +1330,20 @@ class LanceDataset:
             logger.warning(
                 "reencode frame-count validation failed ep=%d cam=%s: encoded=%s "
                 "< required=%d; falling back to copy to preserve seek mapping",
-                episode_index, cam, encoded, min_required_frames,
+                episode_index,
+                cam,
+                encoded,
+                min_required_frames,
             )
             if tmp.exists():
                 tmp.unlink()
             return False
         logger.info(
             "reencode ok ep=%d cam=%s frames=%d (>= %d required)",
-            episode_index, cam, encoded, min_required_frames,
+            episode_index,
+            cam,
+            encoded,
+            min_required_frames,
         )
         return True
 
@@ -1154,21 +1357,36 @@ class LanceDataset:
     ) -> bool:
         """`-c:v copy` remux. Preserves source bitrate exactly. Returns True on success."""
         r = self._run_ffmpeg_with_episode_stream(
-            ep, cam,
+            ep,
+            cam,
             [
-                FFMPEG_BIN, "-y", "-loglevel", "error",
-                "-fflags", "+genpts",
-                "-f", "h264", "-framerate", f"{fps:.6f}",
-                "-i", "-",
-                "-c:v", "copy",
-                "-movflags", "+faststart",
-                "-f", "mp4", str(tmp),
+                FFMPEG_BIN,
+                "-y",
+                "-loglevel",
+                "error",
+                "-fflags",
+                "+genpts",
+                "-f",
+                "h264",
+                "-framerate",
+                f"{fps:.6f}",
+                "-i",
+                "-",
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                str(tmp),
             ],
         )
         if r.returncode != 0:
             logger.warning(
                 "copy remux failed ep=%d cam=%s: %s; falling back to intra-frame encode",
-                episode_index, cam, r.stderr.decode(errors="replace")[:500],
+                episode_index,
+                cam,
+                r.stderr.decode(errors="replace")[:500],
             )
             if tmp.exists():
                 tmp.unlink()
@@ -1180,22 +1398,39 @@ class LanceDataset:
         ep: _EpisodeLance,
         cam: str,
         fps: float,
-        episode_index: int,
+        episode_index: int,  # noqa: ARG002 — kept for symmetry with sibling _materialize_* helpers
         tmp: Path,
     ) -> None:
         """Last-resort intra-frame encode. Bigger files but always works.
 
         Raises RuntimeError if even this fails (no MP4 produced for this cam)."""
         r = self._run_ffmpeg_with_episode_stream(
-            ep, cam,
+            ep,
+            cam,
             [
-                FFMPEG_BIN, "-y", "-loglevel", "error",
-                "-f", "h264", "-framerate", f"{fps:.6f}",
-                "-i", "-",
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-crf", "18", "-g", "1",
-                "-movflags", "+faststart",
-                "-f", "mp4", str(tmp),
+                FFMPEG_BIN,
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "h264",
+                "-framerate",
+                f"{fps:.6f}",
+                "-i",
+                "-",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                "-g",
+                "1",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                str(tmp),
             ],
         )
         if r.returncode != 0:
