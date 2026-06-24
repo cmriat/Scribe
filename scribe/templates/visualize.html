@@ -434,10 +434,10 @@
             </div>
         </div>
 
-        <div class="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-6 place-items-center">
+        <div class="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-3 items-start justify-items-center">
             {% for video_info in videos_info %}
             <div data-video-card x-show="!videoCodecError && videosKeysSelected.includes('{{ video_info.filename }}')"
-                 class="w-full max-w-[460px] rounded-xl border border-zinc-700 bg-zinc-900 shadow-md overflow-hidden">
+                 class="w-full max-w-[600px] rounded-xl border border-zinc-700 bg-zinc-900 shadow-md overflow-hidden">
                 <p data-video-filename class="text-sm font-mono text-zinc-200 bg-zinc-800 px-3 py-2 truncate border-b border-zinc-700">{{ video_info.filename }}</p>
                 <video muted loop type="video/mp4" class="object-contain w-full aspect-video bg-black" @canplaythrough="videoCanPlay($event.target)" @timeupdate="handleVideoTimeUpdate($event.target)" @ended="() => {
                     playbackActive = false;
