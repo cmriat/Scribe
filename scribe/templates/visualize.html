@@ -453,7 +453,22 @@
         </div>
 
         <!-- Graph -->
-        <h2 class="text-xl font-bold mt-2 font-mono">🤖 Robot info</h2>
+        <div class="flex items-center gap-3 mt-2">
+            <h2 class="text-xl font-bold font-mono">🤖 Robot info</h2>
+            <button
+                @click="setRobotInfoVisible(!showRobotInfo)"
+                class="inline-flex items-center gap-1.5 px-2 py-1 rounded-full border border-zinc-700 text-[11px] font-mono transition-colors"
+                :class="showRobotInfo ? 'bg-zinc-700 text-white' : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800'"
+                :aria-pressed="showRobotInfo"
+                :title="showRobotInfo ? 'Hide robot info (charts &amp; table)' : 'Show robot info (charts &amp; table)'"
+            >
+                <span
+                    class="inline-block w-2 h-2 rounded-full transition-colors"
+                    :class="showRobotInfo ? 'bg-emerald-400' : 'bg-zinc-500'"
+                ></span>
+                <span x-text="showRobotInfo ? 'On' : 'Off'"></span>
+            </button>
+        </div>
 
         <!-- 3d arm -->
         <div x-show="robotEnabled" class="w-full mb-4">
@@ -499,7 +514,7 @@
         </div>
 
         <!-- observation & action graph  -->
-        <div class="grid grid-cols-1 xl:grid-cols-5 gap-4 mb-4 w-full items-start">
+        <div x-show="showRobotInfo" class="grid grid-cols-1 xl:grid-cols-5 gap-4 mb-4 w-full items-start">
             <div class="xl:col-span-3 min-w-0">
                 <div id="graph" class="w-full h-[380px]" @mouseleave="handleGraphMouseLeave()">
                 </div>
@@ -1467,6 +1482,7 @@
                 robotJointLimits: {},
                 robot3dController: null,
                 showRobotPanel: true,
+                showRobotInfo: true,
                 theme: 'dark',
                 sidebarWidth: 320,
                 isResizingSidebar: false,
@@ -1515,6 +1531,24 @@
                         localStorage.setItem('datasetVisualizerTheme', theme);
                     } catch (error) {
                         // ignore storage errors
+                    }
+                },
+
+                setRobotInfoVisible(visible) {
+                    const nextVisible = Boolean(visible);
+                    this.showRobotInfo = nextVisible;
+                    try {
+                        localStorage.setItem('datasetVisualizerRobotInfoVisible', nextVisible ? '1' : '0');
+                    } catch (error) {
+                        // ignore storage errors
+                    }
+                    if (nextVisible) {
+                        // The chart was display:none while hidden; re-fit it to its container.
+                        this.$nextTick(() => {
+                            if (this.dygraph && typeof this.dygraph.resize === 'function') {
+                                this.dygraph.resize();
+                            }
+                        });
                     }
                 },
 
@@ -3200,6 +3234,17 @@
                                 this.showRobotPanel = false;
                             } else if (savedRobotPanelVisible === '1') {
                                 this.showRobotPanel = true;
+                            }
+                        } catch (error) {
+                            // ignore storage errors
+                        }
+
+                        try {
+                            const savedRobotInfoVisible = localStorage.getItem('datasetVisualizerRobotInfoVisible');
+                            if (savedRobotInfoVisible === '0') {
+                                this.showRobotInfo = false;
+                            } else if (savedRobotInfoVisible === '1') {
+                                this.showRobotInfo = true;
                             }
                         } catch (error) {
                             // ignore storage errors
