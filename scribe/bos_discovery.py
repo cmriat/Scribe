@@ -114,6 +114,36 @@ def _join_uri(prefix: str, child_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_S3_LIST_CLIENT_CACHE: dict[str, object] = {}
+
+
+def _s3_list_client():
+    """A sync botocore S3 client for listing, memoized per endpoint.
+
+    Auth/endpoint come from the standard ``AWS_*`` env vars (same source Lance's
+    object_store and s3fs use). We talk to botocore directly — instead of
+    ``s3fs.ls`` — purely so we can drive ListObjects **v1** ``Marker``
+    pagination; see ``_list_dir`` for why that is required against BOS.
+    """
+    import os
+
+    import botocore.session
+
+    endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+    client = _S3_LIST_CLIENT_CACHE.get(endpoint)
+    if client is None:
+        session = botocore.session.get_session()
+        client = session.create_client(
+            "s3",
+            endpoint_url=endpoint or None,
+            region_name=(os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"),
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        )
+        _S3_LIST_CLIENT_CACHE[endpoint] = client
+    return client
+
+
 def _list_dir(prefix: str) -> list[str]:
     """Return absolute URIs of direct children of ``prefix``.
 
@@ -121,18 +151,46 @@ def _list_dir(prefix: str) -> list[str]:
     obvious non-directory marker objects. Returns entries with the
     *original* scheme (so ``bos://`` input yields ``bos://`` output,
     keeping Lance's object_store happy on the downstream side).
+
+    Pagination note: BOS's S3-compatible ``ListObjectsV2`` sets
+    ``IsTruncated=True`` but returns **no** ``NextContinuationToken`` (nor
+    ``NextMarker``), so every v2-based pager — ``s3fs.ls`` included — silently
+    stops after the first page (~12 entries). We therefore drive ListObjects
+    **v1** ``Marker`` pagination by hand, which BOS honors, returning the full
+    listing. ``Delimiter='/'`` keeps it to immediate children (``CommonPrefixes``
+    for sub-dirs + ``Contents`` for files directly under the prefix).
     """
     import fsspec
 
-    fs, fs_path = fsspec.core.url_to_fs(_to_fsspec_uri(prefix))
-    children = fs.ls(fs_path, detail=False)
+    _fs, fs_path = fsspec.core.url_to_fs(_to_fsspec_uri(prefix))
+    bucket, _, key = fs_path.partition("/")
+    key = key.rstrip("/")
+    list_prefix = f"{key}/" if key else ""
+
+    client = _s3_list_client()
     out: list[str] = []
-    prefix_path = fs_path.rstrip("/")
-    for entry in children:
-        entry_stripped = entry.rstrip("/")
-        if entry_stripped == prefix_path:
-            continue
-        out.append(_join_uri(prefix, entry))
+    marker = ""
+    prev_marker = None
+    while True:
+        resp = client.list_objects(Bucket=bucket, Prefix=list_prefix, Delimiter="/", Marker=marker)
+        names: list[str] = []
+        for cp in resp.get("CommonPrefixes", []):
+            names.append(cp["Prefix"])
+        for obj in resp.get("Contents", []):
+            obj_key = obj["Key"]
+            if obj_key.rstrip("/") == list_prefix.rstrip("/"):
+                continue  # the prefix-self marker object some stores echo back
+            names.append(obj_key)
+        for name in names:
+            out.append(_join_uri(prefix, f"{bucket}/{name}"))
+        if not resp.get("IsTruncated") or not names:
+            break
+        # BOS omits NextMarker on delimited listings; fall back to the
+        # lexicographically greatest name so Marker always advances.
+        marker = resp.get("NextMarker") or max(names)
+        if marker == prev_marker:
+            break  # safety: never spin on a non-advancing marker
+        prev_marker = marker
     return out
 
 
