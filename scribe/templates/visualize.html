@@ -2736,7 +2736,7 @@
                         }
                         const videoKey = this.videoKeyForElement(video) || String(this.videosInfo[index]?.filename || '');
                         const target = this.frameIndexToVideoTime(frameIndex, videoKey, video.duration);
-                        if (Math.abs(video.currentTime - target) > 0.15) {
+                        if (Math.abs(video.currentTime - target) > 0.01) {
                             video.currentTime = target;
                         }
                     });
