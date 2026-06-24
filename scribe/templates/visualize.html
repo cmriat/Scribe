@@ -448,6 +448,18 @@
                     <source src="{{ video_info.url }}">
                     Your browser does not support the video tag.
                 </video>
+                <template x-if="gripperInfoForVideo('{{ video_info.filename }}')">
+                    <div class="px-3 py-2 border-t border-zinc-700 bg-zinc-900">
+                        <div class="flex items-center justify-between text-xs font-mono text-zinc-300 mb-1">
+                            <span x-text="gripperInfoForVideo('{{ video_info.filename }}').label"></span>
+                            <span class="tabular-nums" x-text="gripperInfoForVideo('{{ video_info.filename }}').valueText"></span>
+                        </div>
+                        <div class="h-2 w-full rounded-full bg-zinc-700 overflow-hidden flex justify-center">
+                            <div class="h-full rounded-full"
+                                 :style="`width:${gripperInfoForVideo('{{ video_info.filename }}').pct}%; background-color:${gripperInfoForVideo('{{ video_info.filename }}').color}`"></div>
+                        </div>
+                    </div>
+                </template>
             </div>
             {% endfor %}
         </div>
@@ -1483,6 +1495,7 @@
                 robot3dController: null,
                 showRobotPanel: true,
                 showRobotInfo: true,
+                gripperMaxMm: 73, // airbot gripper full-open ≈ 73mm → full bar when fully open
                 theme: 'dark',
                 sidebarWidth: 320,
                 isResizingSidebar: false,
@@ -1550,6 +1563,65 @@
                             }
                         });
                     }
+                },
+
+                // Gripper open/close bar shown under the left/right wrist camera.
+                // The gripper opening lives in observation_state (in METERS): a
+                // 14-dim dual-arm vector laid out as [arm1(6 joints + gripper),
+                // arm2(6 joints + gripper)], so each arm's gripper is its block's
+                // last dim (idx 6 and 13 for a 14-dim state). ASSUMPTION: arm1
+                // (first block) = LEFT, arm2 (second block) = RIGHT. Flip the
+                // side<->idx mapping below if the metadata's serials are reversed.
+                gripperInfoForVideo(filename) {
+                    if (!this.currentFrameData || !Array.isArray(this.columns)) {
+                        return null;
+                    }
+                    // Actual camera keys are "observation.images.left|mid|right"
+                    // (older raw-mode names were "*_wrist"); match either form.
+                    const fn = String(filename || '').toLowerCase();
+                    let side = null;
+                    if (fn.includes('left')) side = 'left';
+                    else if (fn.includes('right')) side = 'right';
+                    if (!side) return null; // MID / env camera: no gripper bar
+
+                    // Locate observation_state's offset in the flat per-frame array
+                    // (currentFrameData = [col0 dims..., col1 dims..., ...]).
+                    let offset = 0;
+                    let stateNames = null;
+                    for (const col of this.columns) {
+                        if (String(col.key || '').toLowerCase().includes('state')) {
+                            stateNames = col.value || [];
+                            break;
+                        }
+                        offset += col.value.length;
+                    }
+                    if (!stateNames || stateNames.length < 2) return null;
+
+                    // Prefer the dim explicitly named "<side>...gripper" (this data
+                    // names them left_gripper / right_gripper); fall back to
+                    // positional for a 14-dim [arm1(..,gripper), arm2(..,gripper)].
+                    let dim = stateNames.findIndex((nm) => {
+                        const s = String(nm).toLowerCase();
+                        return s.includes('gripper') && s.includes(side);
+                    });
+                    if (dim < 0) {
+                        dim = side === 'left' ? Math.floor(stateNames.length / 2) - 1 : stateNames.length - 1;
+                    }
+                    const idx = offset + dim;
+                    // currentFrameData holds cell objects {label, value, color, checked},
+                    // not raw numbers — read the numeric `.value`.
+                    const cell = this.currentFrameData[idx];
+                    const raw = cell && typeof cell.value === 'number' ? cell.value : null;
+                    if (raw === null || Number.isNaN(raw)) return null;
+
+                    const mm = raw * 1000; // gripper state is in meters (×1000 → mm)
+                    const pct = Math.max(0, Math.min(100, (mm / this.gripperMaxMm) * 100));
+                    return {
+                        label: side === 'left' ? 'LEFT gripper' : 'RIGHT gripper',
+                        valueText: `${mm.toFixed(1)} mm`,
+                        pct,
+                        color: side === 'left' ? '#3b82f6' : '#f97316',
+                    };
                 },
 
                 setRobotPanelVisible(visible) {
