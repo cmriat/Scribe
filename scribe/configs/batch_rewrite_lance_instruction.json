@@ -2,37 +2,247 @@
   "items": [
     {
       "source": "bos://srgdata/robot/lance_qz_training_data/20260424_qz3_bigshirt_30HZ.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260424_qz3_bigshirt_30HZ_fixed.lance",
       "instruction": "With the shirt is laid flat, fold the shirt, and place it in the upper right corner of the table.",
       "overwrite": false
     },
     {
       "source": "bos://srgdata/robot/lance_qz_training_data/20260507_qz3_bigshirt_test_30HZ.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260507_qz3_bigshirt_test_30HZ_fixed.lance",
       "instruction": "With the shirt is laid flat, fold the shirt, and place it in the upper right corner of the table.",
       "overwrite": false
     },
     {
       "source": "bos://srgdata/robot/lance_qz_training_data/20260507_qz3_hil_30HZ.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260507_qz3_hil_30HZ_fixed.lance",
       "instruction": "With the shirt is laid flat, fold the shirt, and place it in the upper right corner of the table.",
       "overwrite": false
     },
     {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260514_qz3_bigshirt_package_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260514_qz3_bigshirt_package_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260514_qz3_bigshirt_package_v2_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260514_qz3_bigshirt_package_v2_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260515_qz3_bigshirt_package_v2_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260515_qz3_bigshirt_package_v2_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260515_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260515_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260515_qz4_bigshirt_package_v2_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260515_qz4_bigshirt_package_v2_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260518_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260518_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260519_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260519_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260520_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260520_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260521_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260521_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260522_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260522_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260525_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260525_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260526_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260526_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260527_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260527_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260528_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260528_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260529_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260529_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260601_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260601_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260602_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260602_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260603_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260603_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260604_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260604_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260605_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260605_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260608_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260608_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260609_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260609_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260610_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260610_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260610_qz4_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260610_qz4_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260611_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260611_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260612_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260612_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260615_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260615_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
       "source": "bos://srgdata/robot/lance_qz_training_data/20260616_qz2_bigshirt_package_hil_30HZ.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260616_qz2_bigshirt_package_hil_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260617_qz2_bigshirt_package_hil_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260617_qz2_bigshirt_package_hil_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260618_qz2_bigshirt_package_hil_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260618_qz2_bigshirt_package_hil_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260622_qz2_bigshirt_package_hil_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260622_qz2_bigshirt_package_hil_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260622_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260622_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260623_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260623_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260624_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260624_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260625_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260625_qz2_bigshirt_package_v1_30HZ_fixed.lance",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260626_qz2_bigshirt_package_v1_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260626_qz2_bigshirt_package_v1_30HZ_fixed.lance",
       "instruction": "Grab the folded clothes and put them in the bag.",
       "overwrite": false
     },
     {
       "source": "bos://srgdata/robot/lance_qz_training_data/20260625_qz5_shoelaces_tie_30HZ.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260625_qz5_shoelaces_tie_30HZ_fixed.lance",
       "instruction": "Use grippers alternately pick up the shoelaces and complete the lacing of the entire shoe.",
       "overwrite": false
     },
     {
       "source": "bos://srgdata/robot/lance_qz_training_data/20260626_qz5_shoelaces_tie_30HZ.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/20260626_qz5_shoelaces_tie_30HZ_fixed.lance",
       "instruction": "Use grippers alternately pick up the shoelaces and complete the lacing of the entire shoe.",
       "overwrite": false
     }

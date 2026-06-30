@@ -29,6 +29,19 @@ class PlannedBatchRewrite:
     overwrite: bool
 
 
+@dataclass(frozen=True)
+class BatchRewriteFailure:
+    source: str
+    target: str
+    error: str
+
+
+@dataclass(frozen=True)
+class BatchRewriteSummary:
+    successes: list[RewriteResult]
+    failures: list[BatchRewriteFailure]
+
+
 def _items_from_config(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return data
@@ -80,21 +93,28 @@ def plan_batch_rewrites(items: list[BatchRewriteItem]) -> list[PlannedBatchRewri
     return planned
 
 
-def run_batch_rewrites(items: list[BatchRewriteItem]) -> list[RewriteResult]:
-    results: list[RewriteResult] = []
+def run_batch_rewrites(items: list[BatchRewriteItem]) -> BatchRewriteSummary:
+    successes: list[RewriteResult] = []
+    failures: list[BatchRewriteFailure] = []
     planned = plan_batch_rewrites(items)
     for index, item in enumerate(planned, start=1):
         print(f"[{index}/{len(planned)}] {item.source} -> {item.target}", flush=True)
-        result = rewrite_instruction_dataset(
-            item.source,
-            item.target,
-            item.instruction,
-            overwrite=item.overwrite,
-            progress=sys.stdout,
-        )
-        results.append(result)
+        try:
+            result = rewrite_instruction_dataset(
+                item.source,
+                item.target,
+                item.instruction,
+                overwrite=item.overwrite,
+                progress=sys.stdout,
+            )
+        except Exception as exc:  # noqa: BLE001 - batch jobs should report and continue.
+            error = f"{type(exc).__name__}: {exc}"
+            failures.append(BatchRewriteFailure(source=item.source, target=item.target, error=error))
+            print(f"[error] {item.source} -> {item.target}: {error}", file=sys.stderr, flush=True)
+            continue
+        successes.append(result)
         print(f"rewrote {result.rows} row(s), {result.episodes} episode(s): {result.target}", flush=True)
-    return results
+    return BatchRewriteSummary(successes=successes, failures=failures)
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,8 +138,10 @@ def main() -> None:
         print(f"{item.source} -> {item.target} [{overwrite}]")
     if args.dry_run:
         return
-    results = run_batch_rewrites(items)
-    print(f"completed {len(results)} rewrite(s)")
+    summary = run_batch_rewrites(items)
+    print(f"completed {len(summary.successes)} rewrite(s), {len(summary.failures)} failure(s)")
+    if summary.failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

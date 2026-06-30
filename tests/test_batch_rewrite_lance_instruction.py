@@ -126,9 +126,10 @@ class BatchRewriteLanceInstructionTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        results = run_batch_rewrites(load_batch_config(config))
+        summary = run_batch_rewrites(load_batch_config(config))
 
-        self.assertEqual(len(results), 2)
+        self.assertEqual(len(summary.successes), 2)
+        self.assertEqual(len(summary.failures), 0)
         target_a_values = (
             lance.dataset(target_dir / "a.lance")
             .to_table(columns=["language_instruction"])["language_instruction"]
@@ -141,6 +142,42 @@ class BatchRewriteLanceInstructionTest(unittest.TestCase):
         )
         self.assertEqual(target_a_values, ["instruction A", "instruction A"])
         self.assertEqual(target_b_values, ["instruction B", "instruction B"])
+
+    def test_run_batch_rewrites_reports_failure_and_continues(self) -> None:
+        missing_source = self.tmp / "missing.lance"
+        source = self.tmp / "source.lance"
+        target_dir = self.tmp / "out"
+        _write_tiny_lance(source)
+        config = self.tmp / "batch.json"
+        config.write_text(
+            json.dumps(
+                [
+                    {
+                        "source": missing_source.as_posix(),
+                        "target": target_dir.as_posix(),
+                        "instruction": "missing should fail",
+                    },
+                    {
+                        "source": source.as_posix(),
+                        "target": target_dir.as_posix(),
+                        "instruction": "valid should continue",
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        summary = run_batch_rewrites(load_batch_config(config))
+
+        self.assertEqual(len(summary.failures), 1)
+        self.assertIn("missing.lance", summary.failures[0].source)
+        self.assertEqual(len(summary.successes), 1)
+        target_values = (
+            lance.dataset(target_dir / "source.lance")
+            .to_table(columns=["language_instruction"])["language_instruction"]
+            .to_pylist()
+        )
+        self.assertEqual(target_values, ["valid should continue", "valid should continue"])
 
 
 if __name__ == "__main__":

@@ -187,7 +187,7 @@ Lance 视频会按需 materialize 到 `.visualizer_runtime/lance_runtime/videos/
 ```bash
 python -m scribe.tools.rewrite_lance_instruction \
   --source bos://srgdata/robot/test_data/20260420_qz4_bigshirt_mid30.lance \
-  --target bos://srgdata/robot/test_data/test_fold \
+  --target bos://srgdata/robot/test_data/20260420_qz4_bigshirt_mid30_fixed.lance \
   --instruction "准确的新 instruction" \
   --overwrite
 ```
@@ -196,6 +196,7 @@ python -m scribe.tools.rewrite_lance_instruction \
 
 - `--source` 可以是单个 `.lance`，也可以是包含多个直接子级 `*.lance` 的目录/前缀。
 - 当 `--source` 是单个 `.lance` 且 `--target` 是目录时，输出文件名默认沿用源文件名。
+- 当 `--source` 是单个 `.lance` 且要在同一目录生成修正版时，建议把 `--target` 显式写成 `<源文件名>_fixed.lance`。
 - 当 `--source` 是目录/前缀时，`--target` 也必须是目录/前缀；工具会处理其下一层的所有 `*.lance`，并保持原文件名。
 - `bos://` 会在工具内部改写为 Lance/fsspec 可用的 `s3://`，endpoint 仍由 `AWS_ENDPOINT_URL` 决定。
 
@@ -216,13 +217,13 @@ python -m scribe.tools.rewrite_lance_instruction \
   "items": [
     {
       "source": "bos://srgdata/robot/lance_qz_training_data/a.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/a_fixed.lance",
       "instruction": "准确的新 instruction A",
       "overwrite": true
     },
     {
       "source": "bos://srgdata/robot/lance_qz_training_data/b.lance",
-      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "target": "bos://srgdata/robot/lance_qz_training_data/b_fixed.lance",
       "instruction": "准确的新 instruction B"
     }
   ]
@@ -240,7 +241,7 @@ python -m scribe.tools.batch_rewrite_lance_instruction \
   --config batch_rewrite.json
 ```
 
-每个 item 的 `overwrite` 可选；缺省时不覆盖已有目标。也可以在命令行传 `--overwrite`，作为所有未声明 `overwrite` 的 item 的默认值。
+每个 item 的 `overwrite` 可选；缺省时不覆盖已有目标。也可以在命令行传 `--overwrite`，作为所有未声明 `overwrite` 的 item 的默认值。批量执行中某个 item 失败时会在终端打印 `[error] ...`，继续处理后续 item，并在最后汇总成功/失败数量；只要有失败，命令最终返回非 0。
 
 安全边界：
 
