@@ -1,0 +1,40 @@
+{
+  "items": [
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260424_qz3_bigshirt_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "With the shirt is laid flat, fold the shirt, and place it in the upper right corner of the table.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260507_qz3_bigshirt_test_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "With the shirt is laid flat, fold the shirt, and place it in the upper right corner of the table.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260507_qz3_hil_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "With the shirt is laid flat, fold the shirt, and place it in the upper right corner of the table.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260616_qz2_bigshirt_package_hil_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "Grab the folded clothes and put them in the bag.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260625_qz5_shoelaces_tie_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "Use grippers alternately pick up the shoelaces and complete the lacing of the entire shoe.",
+      "overwrite": false
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/20260626_qz5_shoelaces_tie_30HZ.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "Use grippers alternately pick up the shoelaces and complete the lacing of the entire shoe.",
+      "overwrite": false
+    }
+  ]
+}

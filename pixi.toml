@@ -3,7 +3,7 @@ name = "scribe"
 version = "0.1.0"
 description = "LeRobot dataset visualizer & annotator"
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64","osx-arm64"]
 
 [dependencies]
 python = "3.10.*"
@@ -29,6 +29,8 @@ ruff = ">=0.11,<1"
 # release line as the conda-installed fsspec to avoid solver conflicts with
 # lerobot's transitive `datasets` constraint.
 s3fs = "==2025.3.0"
+maturin = ">=1.14.1,<2"
+rust = ">=1.96.0,<1.97"
 
 [pypi-dependencies]
 # lerobot

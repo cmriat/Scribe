@@ -40,6 +40,7 @@ Scribe/
 │   ├── bos_sync.py              # 标注 sidecar 的 BOS pull/push + AutoSaver
 │   ├── annotation_store.py      # 标注 sidecar 存储（CRUD + 校验）
 │   ├── export.py                # 离线导出脚本
+│   ├── tools/                   # 数据处理工具（如 Lance instruction 改写）
 │   ├── templates/
 │   │   ├── visualize.html       # 前端主界面（Alpine.js）
 │   │   └── landing.html         # BOS 数据集选择登录页
@@ -176,6 +177,77 @@ Lance 视频会按需 materialize 到 `.visualizer_runtime/lance_runtime/videos/
 - 视频优先将 Lance 中的 H264 GOP 直接 copy remux 为 MP4；仅在 copy remux 失败时才回退到编码。
 - 前端使用 Lance 的 `*_gop_index` 与 `*_frame_index_in_gop` 推导出的 MP4 内部帧号进行 seek，确保每一行机械臂数据对应原始 Lance 记录中的相机帧。
 - 播放时优先使用浏览器 `requestVideoFrameCallback` 按实际呈现的视频帧同步曲线、表格和 3D 机械臂。
+
+### Lance instruction 改写工具
+
+`scribe.tools.rewrite_lance_instruction` 用于把一个或多个 Lance 数据集复制到新位置，并把实际 `language_instruction` 列改成指定的新指令。它适合修正已经 merge 后、需要继续用于训练的 Lance 数据集。
+
+使用方式：
+
+```bash
+python -m scribe.tools.rewrite_lance_instruction \
+  --source bos://srgdata/robot/test_data/20260420_qz4_bigshirt_mid30.lance \
+  --target bos://srgdata/robot/test_data/test_fold \
+  --instruction "准确的新 instruction" \
+  --overwrite
+```
+
+路径规则：
+
+- `--source` 可以是单个 `.lance`，也可以是包含多个直接子级 `*.lance` 的目录/前缀。
+- 当 `--source` 是单个 `.lance` 且 `--target` 是目录时，输出文件名默认沿用源文件名。
+- 当 `--source` 是目录/前缀时，`--target` 也必须是目录/前缀；工具会处理其下一层的所有 `*.lance`，并保持原文件名。
+- `bos://` 会在工具内部改写为 Lance/fsspec 可用的 `s3://`，endpoint 仍由 `AWS_ENDPOINT_URL` 决定。
+
+正式执行前建议先 dry run：
+
+```bash
+python -m scribe.tools.rewrite_lance_instruction \
+  --source bos://srgdata/robot/test_data/source_folder \
+  --target bos://srgdata/robot/test_data/fixed_folder \
+  --instruction "准确的新 instruction" \
+  --dry-run
+```
+
+批量改写可以使用 JSON 配置：
+
+```json
+{
+  "items": [
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/a.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "准确的新 instruction A",
+      "overwrite": true
+    },
+    {
+      "source": "bos://srgdata/robot/lance_qz_training_data/b.lance",
+      "target": "bos://srgdata/robot/lance_qz_training_data/fixed",
+      "instruction": "准确的新 instruction B"
+    }
+  ]
+}
+```
+
+执行：
+
+```bash
+python -m scribe.tools.batch_rewrite_lance_instruction \
+  --config batch_rewrite.json \
+  --dry-run
+
+python -m scribe.tools.batch_rewrite_lance_instruction \
+  --config batch_rewrite.json
+```
+
+每个 item 的 `overwrite` 可选；缺省时不覆盖已有目标。也可以在命令行传 `--overwrite`，作为所有未声明 `overwrite` 的 item 的默认值。
+
+安全边界：
+
+- 工具不会 in-place 修改源数据；`source` 只读，结果写到新的 `target`。
+- `--overwrite` 只会删除已存在的目标路径，不会删除源路径。
+- 如果中途网络中断，目标路径可能留下半成品；重新使用同一目标路径并加 `--overwrite` 跑一遍即可。
+- 对含 Lance blob 视频列的数据集，工具会参考数据生成脚本的写法，按 episode 重建数据：普通列原样复制，`language_instruction` 全量替换，`task_index` 统一为 `0`，`lerobot:tasks_json` 同步为新的单任务映射，blob 列通过 `take_blobs_data`、`Blob.from_bytes`、`Blob.ref` 重新写入并保持 GOP 复用。
 
 #### v0.2.0 Lance 处理方案
 
