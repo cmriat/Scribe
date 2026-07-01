@@ -248,7 +248,7 @@ python -m scribe.tools.batch_rewrite_lance_instruction \
 - 工具不会 in-place 修改源数据；`source` 只读，结果写到新的 `target`。
 - `--overwrite` 只会删除已存在的目标路径，不会删除源路径。
 - 如果中途网络中断，目标路径可能留下半成品；重新使用同一目标路径并加 `--overwrite` 跑一遍即可。
-- 对含 Lance blob 视频列的数据集，工具会参考数据生成脚本的写法，按 episode 重建数据：普通列原样复制，`language_instruction` 全量替换，`task_index` 统一为 `0`，`lerobot:tasks_json` 同步为新的单任务映射，blob 列通过 `take_blobs_data`、`Blob.from_bytes`、`Blob.ref` 重新写入并保持 GOP 复用。
+- 对含 Lance blob 视频列的数据集，工具不会解码或重写 blob。它只复制 Lance 文件树，然后按 `airbot_play_ws` 的 stamp 方式改轻量列和 schema metadata：`language_instruction` 全量替换，`task_index` 统一为 `0`，`lerobot:tasks_json` 同步为新的单任务映射。
 
 #### v0.2.0 Lance 处理方案
 

@@ -25,10 +25,10 @@ from dataclasses import dataclass
 
 import lance
 import pyarrow as pa
-from lance import Blob, blob_array
 
 LANCE_SUFFIX = ".lance"
 REQUIRED_COLUMNS = {"episode_index", "language_instruction"}
+TASK_INSTRUCTION_COLUMNS = {"task_json_instruction", "tasks_json_instruction"}
 
 
 @dataclass(frozen=True)
@@ -246,6 +246,40 @@ def _assert_instruction_written(ds: lance.LanceDataset, instruction: str) -> Non
         raise RuntimeError(f"verification failed: found language_instruction={bad!r}, expected {instruction!r}")
 
 
+def _assert_task_instruction_columns_written(ds: lance.LanceDataset, instruction: str) -> None:
+    columns = [field.name for field in ds.schema if field.name in TASK_INSTRUCTION_COLUMNS]
+    if not columns:
+        return
+    table = ds.to_table(columns=columns)
+    for column in columns:
+        values = table[column].to_pylist()
+        bad = next((value for value in values if value != instruction), None)
+        if bad is not None:
+            raise RuntimeError(f"verification failed: found {column}={bad!r}, expected {instruction!r}")
+
+
+def _assert_task_metadata_written(ds: lance.LanceDataset, instruction: str) -> None:
+    metadata = ds.schema.metadata or {}
+    raw_tasks = metadata.get(b"lerobot:tasks_json") or metadata.get("lerobot:tasks_json")
+    if raw_tasks is None:
+        raise RuntimeError("verification failed: missing lerobot:tasks_json schema metadata")
+    tasks_text = raw_tasks.decode("utf-8") if isinstance(raw_tasks, bytes) else str(raw_tasks)
+    tasks = json.loads(tasks_text)
+    expected = {"0": instruction}
+    if tasks != expected:
+        raise RuntimeError(f"verification failed: lerobot:tasks_json={tasks!r}, expected {expected!r}")
+
+
+def _assert_task_index_zero(ds: lance.LanceDataset) -> None:
+    schema_names = {field.name for field in ds.schema}
+    if "task_index" not in schema_names:
+        raise RuntimeError("verification failed: missing task_index column")
+    values = ds.to_table(columns=["task_index"])["task_index"].to_pylist()
+    bad = next((value for value in values if int(value) != 0), None)
+    if bad is not None:
+        raise RuntimeError(f"verification failed: found task_index={bad!r}, expected 0")
+
+
 def _blob_columns(ds: lance.LanceDataset) -> list[str]:
     out = []
     for field in ds.schema:
@@ -262,123 +296,8 @@ def _blob_columns(ds: lance.LanceDataset) -> list[str]:
 
 def _schema_metadata_with_instruction(ds: lance.LanceDataset, instruction: str) -> dict[bytes, bytes] | None:
     metadata = dict(ds.schema.metadata or {})
-    schema_names = {field.name for field in ds.schema}
-    if b"lerobot:tasks_json" in metadata or "task_index" in schema_names:
-        metadata[b"lerobot:tasks_json"] = json.dumps({"0": instruction}, ensure_ascii=False).encode("utf-8")
+    metadata[b"lerobot:tasks_json"] = json.dumps({"0": instruction}, ensure_ascii=False).encode("utf-8")
     return metadata or None
-
-
-def _episode_slices(ds: lance.LanceDataset) -> list[tuple[int, int, int]]:
-    values = ds.to_table(columns=["episode_index"])["episode_index"].to_pylist()
-    if not values:
-        return []
-
-    slices: list[tuple[int, int, int]] = []
-    start = 0
-    current = int(values[0])
-    for index, value in enumerate(values[1:], start=1):
-        episode = int(value)
-        if episode == current:
-            continue
-        slices.append((start, index - start, current))
-        start = index
-        current = episode
-    slices.append((start, len(values) - start, current))
-    return slices
-
-
-def _rebuild_blob_column(
-    source_ds: lance.LanceDataset,
-    col: str,
-    *,
-    offset: int,
-    length: int,
-    ref_id_start: int,
-) -> pa.Array:
-    desc = source_ds.to_table(columns=[col], limit=length, offset=offset)[col].combine_chunks()
-    if len(desc) != length:
-        raise RuntimeError(f"{col}: descriptor row count mismatch, expected {length}, got {len(desc)}")
-
-    try:
-        ref_ids = desc.field("ref_id").to_pylist()
-        positions = desc.field("position").to_pylist()
-        sizes = desc.field("size").to_pylist()
-        blob_ids = desc.field("blob_id").to_pylist() if "blob_id" in desc.type else [None] * length
-        blob_uris = desc.field("blob_uri").to_pylist() if "blob_uri" in desc.type else [None] * length
-    except (AttributeError, KeyError):
-        ref_ids = list(range(length))
-        positions = list(range(length))
-        sizes = [None] * length
-        blob_ids = [None] * length
-        blob_uris = [None] * length
-
-    blob_keys = [
-        (
-            index if ref_id is None else int(ref_id),
-            None if position is None else int(position),
-            None if size is None else int(size),
-            None if blob_id is None else int(blob_id),
-            blob_uri,
-        )
-        for index, (ref_id, position, size, blob_id, blob_uri) in enumerate(
-            zip(ref_ids, positions, sizes, blob_ids, blob_uris)
-        )
-    ]
-    first_idx_by_key: dict[tuple[object, ...], int] = {}
-    for index, key in enumerate(blob_keys):
-        if key not in first_idx_by_key:
-            first_idx_by_key[key] = index
-
-    unique_keys = list(first_idx_by_key.keys())
-    source_indices = [offset + first_idx_by_key[key] for key in unique_keys]
-    payloads = source_ds.take_blobs_data(col, indices=source_indices)
-    if len(payloads) != len(unique_keys):
-        raise RuntimeError(f"{col}: take_blobs_data returned {len(payloads)} payloads, expected {len(unique_keys)}")
-    payload_by_key = dict(zip(unique_keys, payloads))
-
-    new_ref_by_old: dict[tuple[object, ...], int] = {}
-    blobs = []
-    next_ref = ref_id_start
-    for key in blob_keys:
-        if key not in new_ref_by_old:
-            new_ref_by_old[key] = next_ref
-            blobs.append(Blob.from_bytes(payload_by_key[key], ref_id=next_ref))
-            next_ref += 1
-        else:
-            blobs.append(Blob.ref(new_ref_by_old[key]))
-    return blob_array(blobs)
-
-
-def _table_with_rewritten_instruction(
-    ds: lance.LanceDataset,
-    *,
-    offset: int,
-    length: int,
-    instruction: str,
-    blob_columns: list[str],
-) -> pa.Table:
-    names = [field.name for field in ds.schema]
-    scalar_columns = [name for name in names if name not in blob_columns]
-    table = ds.to_table(columns=scalar_columns, limit=length, offset=offset)
-    arrays: list[pa.Array | pa.ChunkedArray] = []
-    fields: list[pa.Field] = []
-
-    for field in ds.schema:
-        if field.name == "language_instruction":
-            arrays.append(pa.array([instruction] * length, type=pa.string()))
-            fields.append(field.with_type(pa.string()))
-        elif field.name == "task_index":
-            arrays.append(pa.array([0] * length, type=field.type))
-            fields.append(field)
-        elif field.name in blob_columns:
-            arr = _rebuild_blob_column(ds, field.name, offset=offset, length=length, ref_id_start=offset + 1)
-            arrays.append(arr)
-            fields.append(pa.field(field.name, arr.type, nullable=field.nullable, metadata=field.metadata))
-        else:
-            arrays.append(table[field.name])
-            fields.append(field)
-
-    return pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata=_schema_metadata_with_instruction(ds, instruction)))
 
 
 def _ensure_target_parent(target: str) -> None:
@@ -386,51 +305,42 @@ def _ensure_target_parent(target: str) -> None:
         Path(target).parent.mkdir(parents=True, exist_ok=True)
 
 
-def _rewrite_dataset_by_rebuild(
-    source_ds: lance.LanceDataset,
+def _replace_column(
+    target: str,
+    ds: lance.LanceDataset,
+    column: str,
+    values: pa.Array,
+    *,
+    progress: TextIO | None,
+) -> lance.LanceDataset:
+    if column in {field.name for field in ds.schema}:
+        report(progress, f"dropping {column} ...")
+        ds.drop_columns([column])
+        ds = lance.dataset(to_lance_uri(target))
+    report(progress, f"adding {column} ...")
+    ds.add_columns(pa.table({column: values}))
+    return lance.dataset(to_lance_uri(target))
+
+
+def _rewrite_lightweight_columns_and_metadata(
     target: str,
     instruction: str,
     *,
     rows: int,
-    overwrite: bool,
     progress: TextIO | None,
-) -> None:
-    if _path_exists(target):
-        if not overwrite:
-            raise FileExistsError(f"target already exists: {target} (use --overwrite to replace it)")
-        _remove_tree(target)
-    _ensure_target_parent(target)
-    blob_columns = _blob_columns(source_ds)
-    episode_slices = _episode_slices(source_ds)
-    report(
-        progress,
-        f"rebuilding dataset with blob columns ({len(blob_columns)} blob column(s)); "
-        f"{len(episode_slices)} episode fragment(s)",
-    )
+) -> lance.LanceDataset:
+    ds = lance.dataset(to_lance_uri(target))
+    _validate_rewritable_dataset(ds, target)
+    report(progress, "rewriting lightweight columns ...")
+    text_values = pa.array([instruction] * rows, type=pa.string())
+    ds = _replace_column(target, ds, "language_instruction", text_values, progress=progress)
+    for column in sorted(TASK_INSTRUCTION_COLUMNS & {field.name for field in ds.schema}):
+        ds = _replace_column(target, ds, column, text_values, progress=progress)
+    ds = _replace_column(target, ds, "task_index", pa.array([0] * rows, type=pa.int64()), progress=progress)
 
-    first = True
-    processed = 0
-    for index, (offset, length, episode_index) in enumerate(episode_slices, start=1):
-        episode_table = _table_with_rewritten_instruction(
-            source_ds,
-            offset=offset,
-            length=length,
-            instruction=instruction,
-            blob_columns=blob_columns,
-        )
-        lance.write_dataset(
-            episode_table,
-            to_lance_uri(target),
-            mode="create" if first else "append",
-            data_storage_version="2.2",
-        )
-        first = False
-        processed += length
-        report(
-            progress,
-            f"[{index}/{len(episode_slices)}] episode_index={episode_index}: "
-            f"rewrote {length} row(s), total {processed}/{rows}",
-        )
+    report(progress, "patching lerobot:tasks_json ...")
+    ds.update_schema_metadata({"lerobot:tasks_json": json.dumps({"0": instruction}, ensure_ascii=False)})
+    return lance.dataset(to_lance_uri(target))
 
 
 def rewrite_instruction_dataset(
@@ -455,44 +365,94 @@ def rewrite_instruction_dataset(
 
     report(progress, f"opened source: {rows} row(s), {episodes} episode(s)")
     if _blob_columns(source_ds):
-        _rewrite_dataset_by_rebuild(
-            source_ds,
-            target,
-            instruction,
-            rows=rows,
-            overwrite=overwrite,
-            progress=progress,
-        )
-    else:
-        _copy_tree(source, target, overwrite=overwrite, progress=progress)
-        report(progress, "updating language_instruction ...")
-        target_ds = lance.dataset(to_lance_uri(target))
-        _validate_rewritable_dataset(target_ds, target)
-        target_ds.update({"language_instruction": sql_string_literal(instruction)})
+        report(progress, "detected blob columns; using lightweight column/metadata rewrite without rebuilding blobs")
+    _copy_tree(source, target, overwrite=overwrite, progress=progress)
+    target_ds = _rewrite_lightweight_columns_and_metadata(
+        target,
+        instruction,
+        rows=rows,
+        progress=progress,
+    )
 
-    target_ds = lance.dataset(to_lance_uri(target))
     if int(target_ds.count_rows()) != rows:
         raise RuntimeError(f"row-count verification failed for {target}: expected {rows}, got {target_ds.count_rows()}")
     _assert_instruction_written(target_ds, instruction)
-    report(progress, "verified language_instruction")
+    _assert_task_instruction_columns_written(target_ds, instruction)
+    _assert_task_metadata_written(target_ds, instruction)
+    _assert_task_index_zero(target_ds)
+    report(progress, "verified language_instruction, task_index, lerobot:tasks_json")
 
     return RewriteResult(source=source, target=target, rows=rows, episodes=episodes)
+
+
+def patch_existing_instruction_metadata(
+    target: str,
+    instruction: str,
+    *,
+    progress: TextIO | None = None,
+) -> RewriteResult:
+    if not instruction:
+        raise ValueError("--instruction must not be empty")
+    target = strip_trailing_slash(target)
+    target_ds = lance.dataset(to_lance_uri(target))
+    _validate_rewritable_dataset(target_ds, target)
+    rows = int(target_ds.count_rows())
+    episodes = _count_episodes(target_ds)
+
+    report(progress, f"opened target: {rows} row(s), {episodes} episode(s)")
+    target_ds = _rewrite_lightweight_columns_and_metadata(
+        target,
+        instruction,
+        rows=rows,
+        progress=progress,
+    )
+
+    if int(target_ds.count_rows()) != rows:
+        raise RuntimeError(f"row-count verification failed for {target}: expected {rows}, got {target_ds.count_rows()}")
+    _assert_instruction_written(target_ds, instruction)
+    _assert_task_instruction_columns_written(target_ds, instruction)
+    _assert_task_metadata_written(target_ds, instruction)
+    _assert_task_index_zero(target_ds)
+    report(progress, "verified language_instruction, task_index, lerobot:tasks_json")
+
+    return RewriteResult(source=target, target=target, rows=rows, episodes=episodes)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Copy Lance dataset(s) and rewrite language_instruction.")
     parser.add_argument(
-        "--source", required=True, help="Source .lance URI/path, or directory/prefix containing *.lance."
+        "--source", help="Source .lance URI/path, or directory/prefix containing *.lance."
     )
     parser.add_argument("--target", required=True, help="Target .lance URI/path, or output directory/prefix.")
     parser.add_argument("--instruction", required=True, help="New language_instruction value to write to every row.")
     parser.add_argument("--overwrite", action="store_true", help="Replace target dataset(s) if they already exist.")
+    parser.add_argument(
+        "--patch-existing",
+        action="store_true",
+        help="Patch an existing target only: verify language_instruction, then write task_index and lerobot:tasks_json.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print planned rewrites without copying or updating.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.patch_existing:
+        if args.source:
+            raise ValueError("--source cannot be used with --patch-existing")
+        print(f"patch {args.target}")
+        if args.dry_run:
+            return
+        result = patch_existing_instruction_metadata(
+            args.target,
+            args.instruction,
+            progress=sys.stdout,
+        )
+        print(f"patched {result.rows} row(s), {result.episodes} episode(s): {result.target}")
+        return
+
+    if not args.source:
+        raise ValueError("--source is required unless --patch-existing is used")
     plan = plan_rewrites(args.source, args.target)
     for item in plan:
         print(f"{item.source} -> {item.target}")

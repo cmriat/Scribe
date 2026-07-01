@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import unittest
+import json
 from io import StringIO
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from scribe.tools.rewrite_lance_instruction import (
     plan_rewrites,
     sql_string_literal,
     rewrite_instruction_dataset,
+    patch_existing_instruction_metadata,
 )
 
 
@@ -22,6 +24,18 @@ def _write_tiny_lance(path: Path, instructions: list[str] | None = None) -> None
         {
             "episode_index": pa.array([0, 0, 1, 1], type=pa.int64()),
             "language_instruction": pa.array(instructions, type=pa.string()),
+            "value": pa.array([1, 2, 3, 4], type=pa.int64()),
+        }
+    )
+    lance.write_dataset(table, path, mode="create")
+
+
+def _write_tiny_lance_with_task_json_instruction(path: Path) -> None:
+    table = pa.table(
+        {
+            "episode_index": pa.array([0, 0, 1, 1], type=pa.int64()),
+            "language_instruction": pa.array(["old", "old", "other", "other"], type=pa.string()),
+            "task_json_instruction": pa.array(["old", "old", "other", "other"], type=pa.string()),
             "value": pa.array([1, 2, 3, 4], type=pa.int64()),
         }
     )
@@ -48,6 +62,23 @@ def _write_tiny_blob_lance(path: Path) -> None:
             data_storage_version="2.2",
             schema=table.schema,
         )
+
+
+def _write_tiny_blob_lance_without_task_index(path: Path) -> None:
+    table = pa.table(
+        {
+            "episode_index": pa.array([0, 0], type=pa.int64()),
+            "language_instruction": pa.array(["old", "old"], type=pa.string()),
+            "observation_images_cam_env": blob_array([Blob.from_bytes(b"episode-0-gop", ref_id=1), Blob.ref(1)]),
+        }
+    )
+    lance.write_dataset(
+        table,
+        path,
+        mode="create",
+        data_storage_version="2.2",
+        schema=table.schema,
+    )
 
 
 class RewriteLanceInstructionTest(unittest.TestCase):
@@ -106,7 +137,28 @@ class RewriteLanceInstructionTest(unittest.TestCase):
         target_values = (
             lance.dataset(target).to_table(columns=["language_instruction"])["language_instruction"].to_pylist()
         )
+        target_ds = lance.dataset(target)
+        target_task_indexes = target_ds.to_table(columns=["task_index"])["task_index"].to_pylist()
+        tasks_json = json.loads(target_ds.schema.metadata[b"lerobot:tasks_json"].decode("utf-8"))
         self.assertEqual(source_values, ["old", "old", "other", "other"])
+        self.assertEqual(target_values, ["accurate instruction"] * 4)
+        self.assertEqual(target_task_indexes, [0] * 4)
+        self.assertEqual(tasks_json, {"0": "accurate instruction"})
+
+    def test_rewrite_instruction_dataset_updates_existing_task_json_instruction_column(self) -> None:
+        source = self.tmp / "source.lance"
+        target = self.tmp / "target.lance"
+        _write_tiny_lance_with_task_json_instruction(source)
+
+        rewrite_instruction_dataset(
+            source.as_posix(),
+            target.as_posix(),
+            "accurate instruction",
+            overwrite=False,
+        )
+
+        target_ds = lance.dataset(target)
+        target_values = target_ds.to_table(columns=["task_json_instruction"])["task_json_instruction"].to_pylist()
         self.assertEqual(target_values, ["accurate instruction"] * 4)
 
     def test_rewrite_instruction_dataset_reports_progress(self) -> None:
@@ -126,10 +178,10 @@ class RewriteLanceInstructionTest(unittest.TestCase):
         output = progress.getvalue()
         self.assertIn("copying", output)
         self.assertIn("copied", output)
-        self.assertIn("updating language_instruction", output)
+        self.assertIn("rewriting lightweight columns", output)
         self.assertIn("verified language_instruction", output)
 
-    def test_rewrite_instruction_dataset_rebuilds_blob_dataset_and_updates_column(self) -> None:
+    def test_rewrite_instruction_dataset_updates_blob_dataset_without_rebuilding_blob_columns(self) -> None:
         source = self.tmp / "source.lance"
         target = self.tmp / "target.lance"
         progress = StringIO()
@@ -151,12 +203,60 @@ class RewriteLanceInstructionTest(unittest.TestCase):
         self.assertEqual(source_values, ["old", "old", "other", "other"])
         self.assertEqual(target_values, ["accurate instruction"] * 4)
         self.assertEqual(target_task_indexes, [0, 0, 0, 0])
+        self.assertEqual(
+            json.loads(target_ds.schema.metadata[b"lerobot:tasks_json"].decode("utf-8")),
+            {"0": "accurate instruction"},
+        )
         self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[0])[0].read(), b"episode-0-gop")
         self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[1])[0].read(), b"episode-0-gop")
         self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[2])[0].read(), b"episode-1-gop")
         self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[3])[0].read(), b"episode-1-gop")
-        self.assertIn("rebuilding dataset with blob columns", progress.getvalue())
-        self.assertIn("episode fragment(s)", progress.getvalue())
+        self.assertIn("copying", progress.getvalue())
+        self.assertIn("rewriting lightweight columns", progress.getvalue())
+        self.assertNotIn("rebuilding dataset with blob columns", progress.getvalue())
+
+    def test_rewrite_instruction_dataset_rebuilds_blob_dataset_and_adds_missing_task_metadata(self) -> None:
+        source = self.tmp / "source.lance"
+        target = self.tmp / "target.lance"
+        _write_tiny_blob_lance_without_task_index(source)
+
+        rewrite_instruction_dataset(
+            source.as_posix(),
+            target.as_posix(),
+            "accurate instruction",
+            overwrite=False,
+        )
+
+        target_ds = lance.dataset(target)
+        target_values = target_ds.to_table(columns=["language_instruction"])["language_instruction"].to_pylist()
+        target_task_indexes = target_ds.to_table(columns=["task_index"])["task_index"].to_pylist()
+        tasks_json = json.loads(target_ds.schema.metadata[b"lerobot:tasks_json"].decode("utf-8"))
+        self.assertEqual(target_values, ["accurate instruction", "accurate instruction"])
+        self.assertEqual(target_task_indexes, [0, 0])
+        self.assertEqual(tasks_json, {"0": "accurate instruction"})
+        self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[0])[0].read(), b"episode-0-gop")
+        self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[1])[0].read(), b"episode-0-gop")
+
+    def test_patch_existing_instruction_metadata_updates_task_metadata_without_rebuild(self) -> None:
+        target = self.tmp / "target.lance"
+        _write_tiny_blob_lance_without_task_index(target)
+
+        result = patch_existing_instruction_metadata(
+            target.as_posix(),
+            "old",
+        )
+
+        target_ds = lance.dataset(target)
+        target_values = target_ds.to_table(columns=["language_instruction"])["language_instruction"].to_pylist()
+        target_task_indexes = target_ds.to_table(columns=["task_index"])["task_index"].to_pylist()
+        tasks_json = json.loads(target_ds.schema.metadata[b"lerobot:tasks_json"].decode("utf-8"))
+        self.assertEqual(result.rows, 2)
+        self.assertEqual(result.episodes, 1)
+        self.assertEqual(target_values, ["old", "old"])
+        self.assertEqual(target_task_indexes, [0, 0])
+        self.assertEqual(tasks_json, {"0": "old"})
+        self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[0])[0].read(), b"episode-0-gop")
+        self.assertEqual(target_ds.take_blobs("observation_images_cam_env", indices=[1])[0].read(), b"episode-0-gop")
 
 
 if __name__ == "__main__":
