@@ -325,6 +325,7 @@ def run_server(
 ):
     app = Flask(__name__, static_folder=static_folder.resolve(), template_folder=template_folder.resolve())
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+    app.config["TEMPLATES_AUTO_RELOAD"] = True  # 改模板后免重启，只需刷新浏览器
 
     landing_mode = bos_prefix is not None
     cache_ttl_s = DEFAULT_CACHE_TTL_S
