@@ -785,10 +785,17 @@
                                                 <p class="text-[11px] text-zinc-400" x-text="`#${eventRecord.frame_index} · ${formatFixed(eventRecord.time_s, 2)}s`"></p>
                                                 <p class="text-[11px] text-zinc-500 break-all" x-text="eventRecord.note || ''"></p>
                                             </div>
-                                            <button
-                                                @click="deleteFrameEvent(eventRecord.event_id)"
-                                                class="annotation-panel-input px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800"
-                                            >Delete</button>
+                                            <div class="flex items-center gap-1 shrink-0">
+                                                <button
+                                                    @click="seekToFrame(eventRecord.frame_index)"
+                                                    title="Jump to this frame"
+                                                    class="annotation-panel-input px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800"
+                                                >Jump</button>
+                                                <button
+                                                    @click="deleteFrameEvent(eventRecord.event_id)"
+                                                    class="annotation-panel-input px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800"
+                                                >Delete</button>
+                                            </div>
                                         </div>
                                     </template>
                                 </div>
@@ -814,6 +821,7 @@
                                                     </div>
                                                     <p class="mt-1 text-[11px] text-zinc-400" x-text="`#${segment.frame_start} → #${segment.frame_end}`"></p>
                                                     <p class="text-[11px] text-zinc-500" x-text="`${formatFixed(segment.time_start_s, 2)}s → ${formatFixed(segment.time_end_s, 2)}s`"></p>
+                                                    <p class="text-[11px] text-zinc-400" x-text="`${formatFixed((segment.time_end_s || 0) - (segment.time_start_s || 0), 2)}s`"></p>
                                                 </div>
                                                 <div class="flex items-center gap-1 shrink-0">
                                                     <button @click="editSegment(segment)" class="annotation-panel-input px-2 py-1 rounded border border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800">Edit</button>

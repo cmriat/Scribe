@@ -7,7 +7,7 @@ set -euo pipefail
 # 该前缀下的每个 <name>.lance / 含 episode_*.lance 的子目录都会出现在登录页。
 # =====================================================================
 BOS_PREFIX="${BOS_PREFIX:-bos://srgdata/robot/lance_qz_training_data/}"
-# BOS_PREFIX="${BOS_PREFIX:-bos://srgdata/robot/lance_qz_raw_data/20260609_qz4_bigshirt_package_v1/}"
+
 
 # ---- BOS / S3 凭据 ----
 # Lance 的 object_store 把 bos:// 当 s3:// 直读，凭据走标准 AWS_* 变量。
@@ -17,11 +17,6 @@ BOS_PREFIX="${BOS_PREFIX:-bos://srgdata/robot/lance_qz_training_data/}"
 #   export AWS_ACCESS_KEY_ID=你的AK
 #   export AWS_SECRET_ACCESS_KEY=你的SK
 #   export AWS_DEFAULT_REGION=bj
-# 下面只在变量缺省时给一个非敏感的 endpoint 默认值，AK/SK 一律从环境读取。
-export AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-https://s3.bj.bcebos.com}"
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-bj}"
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
 
 # ---- 其余一般不用改 ----
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
