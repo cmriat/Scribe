@@ -6,6 +6,121 @@
 
 当前版本：v0.3.0
 
+## 2026-08-07：Lance 多用户浏览与三视角快速 Seek 优化
+
+本节记录 `chance/scribe-multiuser-lance-20260807` 分支相对 `main` 的全部改动，以及在
+`192.168.4.90:9006` 验证通过的部署参数。目标是在不改变标注数据格式的前提下，解决 BOS
+Lance 数据集首次打开阻塞、切换 episode 卡顿、大视频随机 seek 缓慢和多用户请求无边界增长等问题。
+
+### 本分支包含的代码更新
+
+| 文件 | 更新内容 |
+|------|----------|
+| `scribe/routes.py` | Lance 视频改为后台异步 materialize；新增进度/重试 API；同一 dataset/episode 去重；限制并发任务和状态数量；无人继续查看时取消任务；支持直接打开尚未从 landing 页注册的 BOS URL；left/mid/right 使用 Lance 有界线程池并行生成。 |
+| `scribe/lance_backend.py` | GOP 流式读取、copy、reencode 和 fallback 编码链路增加进度回调；三路预加载可汇总到 episode 级进度；异常或取消时由原有 `.part` 清理逻辑回收临时文件。 |
+| `scribe/data.py` | episode CSV/timestamp LRU 默认容量由固定 16 改为环境变量控制，默认 128、最小 16。 |
+| `scribe/templates/visualize.html` | 页面在视频后台准备期间显示总进度和逐相机进度；支持失败重试；同页切换 episode 时复用页面而非完整刷新；停留后预取下一 episode；滑块拖动期间只更新预览，释放时才 seek；正常左右键/快进仍保持三视角同时 seek。 |
+
+### 推荐的 9006 生产配置
+
+```bash
+export LANCE_VIDEO_POLICY=reencode
+export LANCE_VIDEO_WORKERS=3
+export LANCE_PRELOAD_NEXT=true
+export LANCE_PREENCODE_ALL=false
+
+export SCRIBE_VIDEO_JOB_WORKERS=2
+export SCRIBE_VIDEO_JOB_STATE_LIMIT=512
+export SCRIBE_VIDEO_JOB_INACTIVE_S=30
+export SCRIBE_EPISODE_DATA_CACHE_MAXSIZE=128
+export SCRIBE_DATASET_LRU=8
+
+python -m scribe \
+  --bos-prefix bos://srgdata/robot/lance_qz_training_data/ \
+  --output-dir ./.visualizer_runtime \
+  --host 0.0.0.0 \
+  --port 9006 \
+  --autosave-interval-s 60 \
+  --3darm false
+```
+
+AWS/BOS 凭据仍必须通过环境变量传入，禁止写进脚本或提交到 Git：
+
+```bash
+export AWS_ENDPOINT_URL=https://s3.bj.bcebos.com
+export AWS_ACCESS_KEY_ID=你的AK
+export AWS_SECRET_ACCESS_KEY=你的SK
+export AWS_DEFAULT_REGION=bj
+```
+
+### 新增运行参数
+
+| 环境变量 | 代码默认值 | 90 推荐值 | 说明 |
+|----------|------------|-----------|------|
+| `LANCE_VIDEO_POLICY` | `copy` | `reencode` | `copy` 启动生成快但文件大；`reencode` 生成较慢，但 MP4 更小且关键帧更密，适合多用户随机 seek。两种缓存使用独立目录，可并存和回滚。 |
+| `LANCE_VIDEO_WORKERS` | `3` | `3` | 单个 episode 内同时生成的相机数；三相机数据建议设为 3。 |
+| `LANCE_PRELOAD_NEXT` | `true` | `true` | 当前 episode 准备好并稳定停留后，预取下一个 episode。 |
+| `SCRIBE_VIDEO_JOB_WORKERS` | `2` | `2` | 同时运行的 episode 视频准备任务数；每个任务内部仍受 `LANCE_VIDEO_WORKERS` 限制。 |
+| `SCRIBE_VIDEO_JOB_STATE_LIMIT` | `512` | `512` | 内存中保留的视频任务状态上限；超限时清理已完成/失败的旧状态，不删除 MP4。 |
+| `SCRIBE_VIDEO_JOB_INACTIVE_S` | `30` | `30` | 浏览器不再轮询后，后台任务允许继续存活的秒数，最小 15 秒。 |
+| `SCRIBE_EPISODE_DATA_CACHE_MAXSIZE` | `128` | `128` | episode CSV 和 timestamp LRU 容量，最小 16；非法值回退到 128。 |
+
+### 页面加载与预取行为
+
+1. 打开 Lance episode 后，metadata/CSV 立即构建，视频在后台生成，页面不再等待三路 MP4 全部完成才返回。
+2. 前端每 2 秒查询当前 episode 视频进度，并显示 left/mid/right 的 GOP 进度。
+3. 三路视频由 `LANCE_VIDEO_WORKERS=3` 并行 materialize，全部就绪后保持三视角同步播放和同步 seek。
+4. 当前 episode 就绪并停留 8 秒后，浏览器只预取一个下一 episode；相同任务在服务端去重。
+5. 预取状态每 4 秒续询；标签页隐藏、切换 episode 或离开页面时停止该浏览器的预取。
+6. 同页切换到已预取 episode 时复用内存中的 payload，避免再次下载数 MB 的 episode JSON。
+7. 进度任务长时间无人查看会自动取消；ffmpeg 子进程终止后删除未完成的 `.part` 文件。
+
+### 为什么 90 推荐 reencode
+
+在 `20260727_qz4_bigshirt_fold_30HZ.lance` 上的实测结果：
+
+| 项目 | `copy` | `reencode` |
+|------|--------|------------|
+| 单路约 121 秒 MP4 | 约 169 MB | 约 9.5–11 MB |
+| 三路合计 | 约 507 MB | 约 31 MB |
+| 关键帧间隔 | 约 2.13 秒 | 1 秒 |
+| 缓存目录后缀 | `h264copy_v1` | `h264reencode_crf23_v1` |
+
+`reencode` 的第一次生成会消耗 CPU，并需要等待数十秒；生成完成后重复访问直接复用小文件缓存。
+不要删除旧 `copy` 缓存来切换策略，两种策略的目录隔离，修改环境变量并重启即可回滚。
+
+三视角连续 seek 验证（episode 75，暂停后连续 30 次右方向键）：
+
+```text
+left : seeking=30, seeked=30
+mid  : seeking=30, seeked=30
+right: seeking=30, seeked=30
+三路最终时间差 < 0.001 秒，readyState 均为 4
+```
+
+### 多用户边界
+
+- 多个标注员连接**同一个 Scribe 进程**时，视频准备任务会按 dataset/episode 去重，并受全局并发和状态上限保护。
+- 前端每个标签页最多预取一个下一 episode；不会递归预取整个数据集。
+- 当前 BOS sidecar 同步仍没有跨服务实例的 ETag/版本冲突检测。不要让 90 和 164 同时修改同一个数据集的标注；多人标注应统一使用同一个 9006 服务。
+- 本分支不修改标注 JSON/JSONL schema，也不修改 curation、segment annotation、frame event 的写入接口。
+
+### 回归检查
+
+提交或部署前至少执行：
+
+```bash
+python -m py_compile scribe/routes.py scribe/lance_backend.py scribe/data.py
+pixi run check
+```
+
+浏览器侧检查：
+
+1. 新开未缓存 episode，确认三相机进度同时从 `reading` 到 `ready`。
+2. 暂停后长按左右键，确认三画面连续变化且最终同步。
+3. 停留 8 秒后检查只出现一个下一 episode JSON 请求。
+4. 保存一条测试标注并确认 autosave/sync 状态正常。
+
 v0.3.0 新增 **BOS / S3 在线可视化**：给一个对象存储前缀即可在登录页列出其下所有 Lance 数据集，点击后按需打开，数据通过 Lance 的 object_store 直接从 BOS 流式读取，无需先整份下载；标注 sidecar 在打开时拉到本地、编辑落本地、再自动回写 BOS。详见下文 [BOS / S3 在线可视化](#bos--s3-在线可视化)。
 
 v0.2.0 完成本地 Lance 数据集可视化适配：支持 `.lance` episode/episode 目录按需打开，支持三路相机 H264 GOP blob materialize 为 MP4，并保持每一行机械臂数据与原始 Lance 相机帧对齐。Lance 数据集上的标注流程尚未完成专项测试和适配。

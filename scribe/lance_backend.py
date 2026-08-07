@@ -28,6 +28,7 @@ import threading
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -723,7 +724,12 @@ class _EpisodeLance:
             self._video_frame_indices[cam] = layout.video_frame_indices
         return layout
 
-    def write_h264_gops(self, cam: str, stream) -> None:
+    def write_h264_gops(
+        self,
+        cam: str,
+        stream,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
         """Write unique H264 GOP blobs to a file-like stream without joining them in memory.
 
         `_gop_layout.first_indices` are episode-local rows (0..row_count-1);
@@ -735,8 +741,13 @@ class _EpisodeLance:
         actual_blob = self._actual(cam)
         global_indices = [self._row_offset + i for i in layout.first_indices]
         blobs = self._ds.take_blobs(actual_blob, indices=global_indices)
-        for blob in blobs:
+        total = len(blobs)
+        if progress_callback is not None:
+            progress_callback(0, total)
+        for completed, blob in enumerate(blobs, start=1):
             stream.write(blob.read())
+            if progress_callback is not None:
+                progress_callback(completed, total)
 
     def video_frame_indices_for_rows(self, cam: str) -> np.ndarray:
         """Map each robot row to the frame index in the materialized MP4.
@@ -1188,9 +1199,16 @@ class LanceDataset:
             self._video_root / f"chunk-{chunk:03d}" / f"observation.images.{cam}" / f"episode_{episode_index:06d}.mp4"
         )
 
-    def _ensure_video(self, episode_index: int, cam: str) -> Path:
+    def _ensure_video(
+        self,
+        episode_index: int,
+        cam: str,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> Path:
         out = self._video_path(episode_index, cam)
         if out.exists() and out.stat().st_size > 0:
+            if progress_callback is not None:
+                progress_callback(1, 1, "ready")
             return out
         # Per-video lock so different cameras can encode in parallel.
         lock_key = (episode_index, cam)
@@ -1200,6 +1218,8 @@ class LanceDataset:
             vlock = self._video_locks[lock_key]
         with vlock:
             if out.exists() and out.stat().st_size > 0:
+                if progress_callback is not None:
+                    progress_callback(1, 1, "ready")
                 return out
             out.parent.mkdir(parents=True, exist_ok=True)
             ep = self._episodes[episode_index]
@@ -1231,17 +1251,34 @@ class LanceDataset:
                         episode_index,
                         tmp,
                         min_required_frames,
+                        progress_callback,
                     )
                 # ── Tier 2: -c:v copy remux (fast, original bitrate) ──────────
                 # Always available as a safety fallback when reencode fails
                 # frame-count validation, OR as the primary path under policy=copy.
                 if not produced:
-                    produced = self._materialize_copy(ep, cam, fps, episode_index, tmp)
+                    produced = self._materialize_copy(
+                        ep,
+                        cam,
+                        fps,
+                        episode_index,
+                        tmp,
+                        progress_callback,
+                    )
                 # ── Tier 3: intra-frame libx264 fallback (legacy behavior) ────
                 # Only reached if both copy and (when applicable) reencode failed.
                 if not produced:
-                    self._materialize_intra_fallback(ep, cam, fps, episode_index, tmp)
+                    self._materialize_intra_fallback(
+                        ep,
+                        cam,
+                        fps,
+                        episode_index,
+                        tmp,
+                        progress_callback,
+                    )
                 tmp.replace(out)
+                if progress_callback is not None:
+                    progress_callback(1, 1, "ready")
             finally:
                 if tmp.exists():
                     try:
@@ -1258,6 +1295,7 @@ class LanceDataset:
         episode_index: int,
         tmp: Path,
         min_required_frames: int,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> bool:
         """Re-encode source GOPs to a smaller, browser-friendly MP4.
 
@@ -1314,6 +1352,7 @@ class LanceDataset:
                 "mp4",
                 str(tmp),
             ],
+            progress_callback,
         )
         if r.returncode != 0:
             logger.warning(
@@ -1354,6 +1393,7 @@ class LanceDataset:
         fps: float,
         episode_index: int,
         tmp: Path,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> bool:
         """`-c:v copy` remux. Preserves source bitrate exactly. Returns True on success."""
         r = self._run_ffmpeg_with_episode_stream(
@@ -1380,6 +1420,7 @@ class LanceDataset:
                 "mp4",
                 str(tmp),
             ],
+            progress_callback,
         )
         if r.returncode != 0:
             logger.warning(
@@ -1400,6 +1441,7 @@ class LanceDataset:
         fps: float,
         episode_index: int,  # noqa: ARG002 — kept for symmetry with sibling _materialize_* helpers
         tmp: Path,
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> None:
         """Last-resort intra-frame encode. Bigger files but always works.
 
@@ -1432,12 +1474,18 @@ class LanceDataset:
                 "mp4",
                 str(tmp),
             ],
+            progress_callback,
         )
         if r.returncode != 0:
             raise RuntimeError(f"ffmpeg encode failed: {r.stderr.decode(errors='replace')[:500]}")
 
     @staticmethod
-    def _run_ffmpeg_with_episode_stream(ep: _EpisodeLance, cam: str, cmd: list[str]) -> subprocess.CompletedProcess:
+    def _run_ffmpeg_with_episode_stream(
+        ep: _EpisodeLance,
+        cam: str,
+        cmd: list[str],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> subprocess.CompletedProcess:
         """Run ffmpeg while streaming GOP blobs to stdin to avoid one large bytes join."""
         proc = subprocess.Popen(
             cmd,
@@ -1448,7 +1496,15 @@ class LanceDataset:
         stderr = b""
         try:
             assert proc.stdin is not None
-            ep.write_h264_gops(cam, proc.stdin)
+            ep.write_h264_gops(
+                cam,
+                proc.stdin,
+                (
+                    (lambda completed, total: progress_callback(completed, total, "reading"))
+                    if progress_callback is not None
+                    else None
+                ),
+            )
             proc.stdin.close()
             assert proc.stderr is not None
             stderr = proc.stderr.read()
@@ -1464,13 +1520,25 @@ class LanceDataset:
             proc.wait()
             raise
 
-    def _preload_videos(self, episode_index: int) -> None:
+    def _preload_videos(
+        self,
+        episode_index: int,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> None:
         """Materialize all cameras for an episode, with bounded concurrency."""
         errors: list[tuple[str, Exception]] = []
 
         def _encode(cam: str):
             try:
-                self._ensure_video(episode_index, cam)
+                self._ensure_video(
+                    episode_index,
+                    cam,
+                    (
+                        (lambda completed, total, stage: progress_callback(cam, completed, total, stage))
+                        if progress_callback is not None
+                        else None
+                    ),
+                )
             except Exception as exc:
                 errors.append((cam, exc))
                 logger.warning("preload failed ep=%d cam=%s", episode_index, cam, exc_info=True)

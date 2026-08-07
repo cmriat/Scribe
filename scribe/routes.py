@@ -8,6 +8,7 @@ and starts the development server.
 import os
 import re
 import json
+import time
 import logging
 import threading
 from pathlib import Path
@@ -227,7 +228,13 @@ def _build_annotation_response_context(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_dataset_or_error(ns: str, name: str, registry: DatasetRegistry):
+def _resolve_dataset_or_error(
+    ns: str,
+    name: str,
+    registry: DatasetRegistry,
+    *,
+    bos_prefix: str | None = None,
+):
     """Resolve a dataset for the (ns, name) URL pair.
 
     Priority:
@@ -239,11 +246,49 @@ def _resolve_dataset_or_error(ns: str, name: str, registry: DatasetRegistry):
     Returns the dataset object on success, or a ``(message, http_code)`` tuple
     that the caller serialises into the appropriate response shape.
     """
+    if bos_prefix is None:
+        bos_prefix = getattr(registry, "_scribe_bos_prefix", None)
     repo_id = f"{ns}/{name}"
     try:
         resolved_dataset = registry.get(ns, name)
     except KeyError:
         resolved_dataset = None
+    if resolved_dataset is None and bos_prefix is not None and ns == "bos":
+        # A user may bookmark/open an episode URL before visiting the landing
+        # page.  Register merged Lance paths directly instead of mistakenly
+        # falling through to the Hugging Face resolver.
+        if name.endswith(".lance"):
+            registry.register_remote(
+                _RemoteEntry(
+                    ns=ns,
+                    name=name,
+                    uri=f"{bos_prefix.rstrip('/')}/{name}",
+                    form="merged",
+                    episode_count=None,
+                )
+            )
+        else:
+            try:
+                discovered = list_bos_datasets_cached(bos_prefix)
+                registry.register_remote_batch(
+                    [
+                        _RemoteEntry(
+                            ns="bos",
+                            name=derive_slug(entry.name),
+                            uri=entry.uri,
+                            form=entry.form,
+                            episode_count=entry.episode_count,
+                        )
+                        for entry in discovered
+                    ]
+                )
+            except Exception as exc:
+                logging.exception("BOS discovery failed while resolving %s/%s", ns, name)
+                return f"BOS dataset discovery failed: {exc}", 503
+        try:
+            resolved_dataset = registry.get(ns, name)
+        except KeyError:
+            return f"BOS dataset not found: {ns}/{name}", 404
     if resolved_dataset is None:
         try:
             resolved_dataset = get_dataset_info(repo_id)
@@ -328,7 +373,169 @@ def run_server(
     app.config["TEMPLATES_AUTO_RELOAD"] = True  # 改模板后免重启，只需刷新浏览器
 
     landing_mode = bos_prefix is not None
+    registry._scribe_bos_prefix = bos_prefix
     cache_ttl_s = DEFAULT_CACHE_TTL_S
+    video_prepare_lock = Lock()
+    video_prepare_jobs: dict[tuple[str, str, int], dict] = {}
+    try:
+        video_job_workers = max(1, int(os.environ.get("SCRIBE_VIDEO_JOB_WORKERS", "2")))
+    except ValueError:
+        video_job_workers = 2
+    video_prepare_slots = threading.BoundedSemaphore(video_job_workers)
+    video_job_state_limit = max(64, int(os.environ.get("SCRIBE_VIDEO_JOB_STATE_LIMIT", "512")))
+    video_job_inactive_s = max(15.0, float(os.environ.get("SCRIBE_VIDEO_JOB_INACTIVE_S", "30")))
+
+    def _prune_video_prepare_jobs() -> None:
+        """Bound completed job metadata; MP4 files remain untouched on disk."""
+        if len(video_prepare_jobs) <= video_job_state_limit:
+            return
+        target_size = max(32, video_job_state_limit * 3 // 4)
+        for old_key in list(video_prepare_jobs):
+            if len(video_prepare_jobs) <= target_size:
+                break
+            if video_prepare_jobs[old_key]["status"] in {"ready", "error"}:
+                video_prepare_jobs.pop(old_key, None)
+
+    def _video_prepare_snapshot(dataset_namespace: str, dataset_name: str, episode_id: int) -> dict:
+        key = (dataset_namespace, dataset_name, int(episode_id))
+        with video_prepare_lock:
+            _prune_video_prepare_jobs()
+            job = video_prepare_jobs.get(key)
+            if job is None:
+                snapshot = {
+                    "status": "idle",
+                    "progress": 0.0,
+                    "cameras": {},
+                    "error": None,
+                }
+            else:
+                job["last_requested_at"] = time.monotonic()
+                snapshot = {
+                    "status": job["status"],
+                    "progress": float(job["progress"]),
+                    "cameras": {name: dict(value) for name, value in job["cameras"].items()},
+                    "error": job.get("error"),
+                }
+        snapshot["status_url"] = url_for(
+            "video_preparation_status",
+            dataset_namespace=dataset_namespace,
+            dataset_name=dataset_name,
+            episode_id=episode_id,
+        )
+        return snapshot
+
+    def _start_video_preparation(
+        dataset_obj,
+        dataset_namespace: str,
+        dataset_name: str,
+        episode_id: int,
+        *,
+        restart_failed: bool = False,
+    ) -> dict:
+        """Start one deduplicated background video job and return its status."""
+        if not isinstance(dataset_obj, LanceDataset):
+            return {
+                "status": "ready",
+                "progress": 1.0,
+                "cameras": {},
+                "error": None,
+                "status_url": None,
+            }
+
+        episode_id = int(episode_id)
+        key = (dataset_namespace, dataset_name, episode_id)
+        cameras = [video_key.rsplit(".", 1)[-1] for video_key in dataset_obj.meta.video_keys]
+
+        with video_prepare_lock:
+            _prune_video_prepare_jobs()
+            existing = video_prepare_jobs.get(key)
+            if existing is not None and not (restart_failed and existing["status"] == "error"):
+                should_start = False
+            else:
+                camera_state = {}
+                for camera in cameras:
+                    video_path = dataset_obj._video_path(episode_id, camera)
+                    ready = video_path.exists() and video_path.stat().st_size > 0
+                    camera_state[camera] = {
+                        "status": "ready" if ready else "queued",
+                        "progress": 1.0 if ready else 0.0,
+                        "completed_gops": None,
+                        "total_gops": None,
+                    }
+                all_ready = bool(camera_state) and all(state["status"] == "ready" for state in camera_state.values())
+                video_prepare_jobs[key] = {
+                    "status": "ready" if all_ready else "queued",
+                    "progress": 1.0
+                    if all_ready
+                    else (sum(state["progress"] for state in camera_state.values()) / max(1, len(camera_state))),
+                    "cameras": camera_state,
+                    "error": None,
+                    "last_requested_at": time.monotonic(),
+                }
+                should_start = not all_ready
+
+        if should_start:
+
+            def _report(camera: str, completed: int, total: int, stage: str) -> None:
+                with video_prepare_lock:
+                    job = video_prepare_jobs.get(key)
+                    if job is None:
+                        raise RuntimeError("video preparation state was evicted")
+                    if time.monotonic() - job["last_requested_at"] > video_job_inactive_s:
+                        raise RuntimeError("video preparation canceled: no active viewer")
+                    total = max(0, int(total))
+                    completed = max(0, int(completed))
+                    camera_progress = 1.0 if stage == "ready" else (min(0.99, completed / total) if total else 0.0)
+                    job["cameras"][camera] = {
+                        "status": "ready" if stage == "ready" else "reading",
+                        "progress": camera_progress,
+                        "completed_gops": completed if total else None,
+                        "total_gops": total or None,
+                    }
+                    job["status"] = "running"
+                    job["progress"] = sum(state["progress"] for state in job["cameras"].values()) / max(
+                        1, len(job["cameras"])
+                    )
+
+            def _prepare() -> None:
+                with video_prepare_slots:
+                    with video_prepare_lock:
+                        video_prepare_jobs[key]["status"] = "running"
+                    try:
+                        # Match the original three-view behavior: materialize all
+                        # cameras concurrently using LanceDataset's bounded worker
+                        # pool. This keeps left/mid/right available together.
+                        dataset_obj._preload_videos(episode_id, _report)
+                    except Exception as exc:
+                        logging.exception(
+                            "background video preparation failed dataset=%s/%s ep=%d",
+                            dataset_namespace,
+                            dataset_name,
+                            episode_id,
+                        )
+                        with video_prepare_lock:
+                            job = video_prepare_jobs[key]
+                            job["status"] = "error"
+                            job["error"] = str(exc)
+                    else:
+                        with video_prepare_lock:
+                            job = video_prepare_jobs[key]
+                            for camera in cameras:
+                                job["cameras"][camera].update(
+                                    status="ready",
+                                    progress=1.0,
+                                )
+                            job["status"] = "ready"
+                            job["progress"] = 1.0
+                            job["error"] = None
+
+            threading.Thread(
+                target=_prepare,
+                name=f"video-prepare-{dataset_name}-{episode_id}",
+                daemon=True,
+            ).start()
+
+        return _video_prepare_snapshot(dataset_namespace, dataset_name, episode_id)
 
     def _mark_sync_dirty(ns: str, name: str) -> None:
         """Notify the sync layer that this dataset's sidecar files changed.
@@ -524,12 +731,14 @@ def run_server(
         dataset_name: str,
         episode_id: int,
         episodes_value: list[int] | None,
+        *,
+        wait_for_videos: bool = True,
     ) -> dict:
         annotation_context = registry.annotation_context(dataset_namespace, dataset_name, repo_id)
         curation_context = _build_episode_curation_context(annotation_context)
         current_preload_thread = None
         current_preload_errors: list[Exception] = []
-        if isinstance(dataset_obj, LanceDataset):
+        if wait_for_videos and isinstance(dataset_obj, LanceDataset):
             # Start materialization while building the CSV/metadata payload.
             def _preload_current_episode() -> None:
                 try:
@@ -576,7 +785,14 @@ def run_server(
                         target=_preload_next_episode,
                         daemon=True,
                     ).start()
-            video_paths = [dataset_obj.meta.get_video_file_path(episode_id, key) for key in dataset_obj.meta.video_keys]
+            if isinstance(dataset_obj, LanceDataset) and not wait_for_videos:
+                video_paths = [
+                    dataset_obj._video_path(episode_id, key.rsplit(".", 1)[-1]) for key in dataset_obj.meta.video_keys
+                ]
+            else:
+                video_paths = [
+                    dataset_obj.meta.get_video_file_path(episode_id, key) for key in dataset_obj.meta.video_keys
+                ]
             video_root_here = _dataset_video_root(dataset_namespace, dataset_name)
             videos_info = []
             for video_path in video_paths:
@@ -672,6 +888,13 @@ def run_server(
         if isinstance(resolved_dataset, tuple) or isinstance(resolved_dataset, str):
             return resolved_dataset
 
+        video_preparation = _start_video_preparation(
+            resolved_dataset,
+            dataset_namespace,
+            dataset_name,
+            episode_id,
+            restart_failed=True,
+        )
         payload = _build_episode_payload(
             resolved_dataset,
             repo_id,
@@ -679,6 +902,12 @@ def run_server(
             dataset_name,
             episode_id,
             episodes,
+            wait_for_videos=False,
+        )
+        payload["video_preparation"] = (
+            _video_prepare_snapshot(dataset_namespace, dataset_name, episode_id)
+            if isinstance(resolved_dataset, LanceDataset)
+            else video_preparation
         )
 
         return render_template(
@@ -711,6 +940,13 @@ def run_server(
         if isinstance(resolved_dataset, str):
             return jsonify({"error": resolved_dataset}), 400
 
+        _start_video_preparation(
+            resolved_dataset,
+            dataset_namespace,
+            dataset_name,
+            episode_id,
+            restart_failed=True,
+        )
         payload = _build_episode_payload(
             resolved_dataset,
             repo_id,
@@ -718,8 +954,34 @@ def run_server(
             dataset_name,
             episode_id,
             episodes,
+            wait_for_videos=False,
+        )
+        payload["video_preparation"] = _video_prepare_snapshot(
+            dataset_namespace,
+            dataset_name,
+            episode_id,
         )
         return jsonify(payload)
+
+    @app.route(
+        "/<string:dataset_namespace>/<string:dataset_name>/api/video-preparation/<int:episode_id>",
+        methods=["GET", "POST"],
+    )
+    def video_preparation_status(dataset_namespace, dataset_name, episode_id):
+        resolved_dataset = _resolve_dataset_or_error(dataset_namespace, dataset_name, registry)
+        if isinstance(resolved_dataset, tuple):
+            message, code = resolved_dataset
+            return jsonify({"error": message}), code
+        if isinstance(resolved_dataset, str):
+            return jsonify({"error": resolved_dataset}), 400
+        status = _start_video_preparation(
+            resolved_dataset,
+            dataset_namespace,
+            dataset_name,
+            episode_id,
+            restart_failed=(request.method == "POST"),
+        )
+        return jsonify(status)
 
     @app.route(
         "/<string:dataset_namespace>/<string:dataset_name>/api/episode-curation",

@@ -5,6 +5,7 @@ This module has no Flask dependency. It provides pure data access logic
 operating on LeRobotDataset / IterableNamespace objects.
 """
 
+import os
 import logging
 from io import StringIO
 from threading import Lock
@@ -71,7 +72,13 @@ def split_repo_id(repo_id: str) -> tuple[str, str]:
 # Episode data / timestamp LRU cache
 # ---------------------------------------------------------------------------
 
-EPISODE_DATA_CACHE_MAXSIZE = 16
+try:
+    EPISODE_DATA_CACHE_MAXSIZE = max(
+        16,
+        int(os.environ.get("SCRIBE_EPISODE_DATA_CACHE_MAXSIZE", "128")),
+    )
+except ValueError:
+    EPISODE_DATA_CACHE_MAXSIZE = 128
 _episode_data_cache: OrderedDict[tuple[str, int], tuple[str, list[dict], list[str]]] = OrderedDict()
 _episode_data_cache_lock = Lock()
 _episode_timestamp_cache: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()

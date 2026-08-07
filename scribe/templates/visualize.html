@@ -398,6 +398,35 @@
         </div>
         <div id="fatalError" class="hidden mt-2 p-3 text-sm border border-red-500 text-red-300 rounded bg-black/50 font-mono"></div>
 
+        <div x-show="videoPreparation && videoPreparation.status !== 'ready'"
+             x-cloak
+             class="mt-2 rounded-lg border border-sky-700/70 bg-sky-950/40 p-3 font-mono text-xs text-sky-100">
+            <div class="flex items-center justify-between gap-4">
+                <span x-text="videoPreparationLabel()"></span>
+                <span class="tabular-nums" x-text="`${videoPreparationProgressPct()}%`"></span>
+            </div>
+            <div class="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
+                <div class="h-full rounded-full bg-sky-500 transition-all duration-300"
+                     :class="videoPreparationProgressPct() === 0 && videoPreparation.status !== 'error' ? 'animate-pulse' : ''"
+                     :style="`width:${Math.max(2, videoPreparationProgressPct())}%`"></div>
+            </div>
+            <div class="mt-2 grid grid-cols-1 gap-1 sm:grid-cols-3">
+                <template x-for="camera in videoPreparationCameraEntries()" :key="camera.name">
+                    <div class="flex items-center justify-between rounded border border-zinc-700 bg-black/20 px-2 py-1">
+                        <span x-text="camera.name"></span>
+                        <span class="tabular-nums" x-text="camera.label"></span>
+                    </div>
+                </template>
+            </div>
+            <div x-show="videoPreparation.status === 'error'" class="mt-2 flex items-center gap-3 text-red-300">
+                <span class="break-all" x-text="videoPreparation.error || 'Video preparation failed'"></span>
+                <button @click="retryVideoPreparation()"
+                        class="shrink-0 rounded border border-red-500 px-2 py-1 hover:bg-red-950">
+                    Retry
+                </button>
+            </div>
+        </div>
+
         <!-- Videos -->
         <div class="flex flex-wrap items-center gap-x-4 gap-y-2 mt-2 mb-4">
             <h2 class="text-xl font-bold font-mono">📷 Camera Views</h2>
@@ -896,6 +925,11 @@
                 <span class="text-sm ml-1">x</span>
             </div>
             <input x-ref="slider" max="100" min="0" step="1" type="range" value="0" class="mx-2 min-w-[180px] flex-1 max-w-[520px]" @input="() => {
+                const sliderValue = Number($refs.slider.value || 0);
+                const total = Math.max(1, currentEpisodeFrameCount - 1);
+                const frameIndex = Math.round((sliderValue / 100) * total);
+                applyFrameSelection(frameIndex, { syncVideos: false, updateUrl: false });
+            }" @change="() => {
                 const sliderValue = Number($refs.slider.value || 0);
                 const total = Math.max(1, currentEpisodeFrameCount - 1);
                 const frameIndex = Math.round((sliderValue / 100) * total);
@@ -1476,6 +1510,21 @@
                 robotSceneReady: false,
                 autoPlayStarted: false,
                 playbackActive: false,
+                videoPreparation: (window.__INITIAL_EPISODE_PAYLOAD__ || {}).video_preparation || {
+                    status: 'ready',
+                    progress: 1.0,
+                    cameras: {},
+                    error: null,
+                    status_url: null,
+                },
+                pendingEpisodeId: null,
+                _videoPreparationPollId: 0,
+                _episodePrefetchTimer: null,
+                _episodePrefetchAbortController: null,
+                _episodePrefetchToken: 0,
+                _episodePrefetchTargetId: null,
+                prefetchedEpisodeId: null,
+                prefetchedEpisodePayload: null,
                 _videoSyncTimer: null,
                 _primaryVideoFrameCallbackId: null,
                 isEpisodeLoading: false,
@@ -2487,6 +2536,280 @@
                     return payload;
                 },
 
+                cancelEpisodePrefetch({ clearPayload = false } = {}) {
+                    if (this._episodePrefetchTimer) {
+                        window.clearTimeout(this._episodePrefetchTimer);
+                        this._episodePrefetchTimer = null;
+                    }
+                    if (this._episodePrefetchAbortController) {
+                        this._episodePrefetchAbortController.abort();
+                        this._episodePrefetchAbortController = null;
+                    }
+                    this._episodePrefetchToken += 1;
+                    this._episodePrefetchTargetId = null;
+                    if (clearPayload) {
+                        this.prefetchedEpisodeId = null;
+                        this.prefetchedEpisodePayload = null;
+                    }
+                },
+
+                nextEpisodeIdAfter(episodeId = this.currentEpisodeId) {
+                    const currentIndex = (this.episodes || []).indexOf(Number(episodeId));
+                    if (currentIndex < 0) {
+                        return null;
+                    }
+                    const nextEpisodeId = this.episodes[currentIndex + 1];
+                    return Number.isFinite(Number(nextEpisodeId)) ? Number(nextEpisodeId) : null;
+                },
+
+                async pollPrefetchedEpisodePreparation(statusUrl, episodeId, token) {
+                    if (!statusUrl) {
+                        return;
+                    }
+                    while (
+                        token === this._episodePrefetchToken
+                        && Number(episodeId) === this.nextEpisodeIdAfter()
+                        && Number(episodeId) === this.prefetchedEpisodeId
+                    ) {
+                        await new Promise((resolve) => window.setTimeout(resolve, 4000));
+                        if (token !== this._episodePrefetchToken || document.visibilityState !== 'visible') {
+                            return;
+                        }
+                        try {
+                            const response = await fetch(statusUrl, {
+                                cache: 'no-store',
+                                headers: { Accept: 'application/json' },
+                            });
+                            if (!response.ok) {
+                                return;
+                            }
+                            const status = await response.json();
+                            if (
+                                token !== this._episodePrefetchToken
+                                || Number(episodeId) !== this.prefetchedEpisodeId
+                                || !this.prefetchedEpisodePayload
+                            ) {
+                                return;
+                            }
+                            this.prefetchedEpisodePayload.video_preparation = status;
+                            if (status.status === 'ready' || status.status === 'error') {
+                                return;
+                            }
+                        } catch (error) {
+                            if (error?.name !== 'AbortError') {
+                                console.debug('Next episode video prefetch stopped', error);
+                            }
+                            return;
+                        }
+                    }
+                },
+
+                scheduleNextEpisodePrefetch() {
+                    const baseEpisodeId = this.currentEpisodeId;
+                    const nextEpisodeId = this.nextEpisodeIdAfter(baseEpisodeId);
+                    if (this._episodePrefetchTargetId === nextEpisodeId) {
+                        return;
+                    }
+                    if (this.prefetchedEpisodeId === nextEpisodeId) {
+                        const status = this.prefetchedEpisodePayload?.video_preparation;
+                        if (
+                            status?.status !== 'ready'
+                            && status?.status !== 'error'
+                            && status?.status_url
+                            && document.visibilityState === 'visible'
+                        ) {
+                            this._episodePrefetchTargetId = nextEpisodeId;
+                            this.pollPrefetchedEpisodePreparation(
+                                status.status_url,
+                                nextEpisodeId,
+                                this._episodePrefetchToken,
+                            );
+                        }
+                        return;
+                    }
+                    this.cancelEpisodePrefetch({
+                        clearPayload: this.prefetchedEpisodeId !== nextEpisodeId,
+                    });
+                    if (
+                        nextEpisodeId == null
+                        || this.isEpisodeLoading
+                        || this.videoPreparation?.status !== 'ready'
+                    ) {
+                        return;
+                    }
+
+                    this._episodePrefetchTargetId = nextEpisodeId;
+                    const token = this._episodePrefetchToken;
+                    this._episodePrefetchTimer = window.setTimeout(async () => {
+                        this._episodePrefetchTimer = null;
+                        if (
+                            token !== this._episodePrefetchToken
+                            || this.currentEpisodeId !== baseEpisodeId
+                            || this.isEpisodeLoading
+                            || document.visibilityState !== 'visible'
+                        ) {
+                            return;
+                        }
+                        const controller = new AbortController();
+                        this._episodePrefetchAbortController = controller;
+                        try {
+                            const response = await fetch(`${this.episodeHref(nextEpisodeId)}.json`, {
+                                cache: 'no-store',
+                                headers: { Accept: 'application/json' },
+                                signal: controller.signal,
+                            });
+                            if (!response.ok) {
+                                throw new Error(`failed to prefetch episode ${nextEpisodeId} (${response.status})`);
+                            }
+                            const payload = await response.json();
+                            if (payload?.error) {
+                                throw new Error(payload.error);
+                            }
+                            if (
+                                token !== this._episodePrefetchToken
+                                || this.currentEpisodeId !== baseEpisodeId
+                                || nextEpisodeId !== this.nextEpisodeIdAfter()
+                            ) {
+                                return;
+                            }
+                            this.prefetchedEpisodeId = nextEpisodeId;
+                            this.prefetchedEpisodePayload = payload;
+                            this.pollPrefetchedEpisodePreparation(
+                                payload?.video_preparation?.status_url,
+                                nextEpisodeId,
+                                token,
+                            );
+                        } catch (error) {
+                            if (error?.name !== 'AbortError') {
+                                console.debug('Next episode prefetch failed', error);
+                            }
+                            if (token === this._episodePrefetchToken) {
+                                this._episodePrefetchTargetId = null;
+                            }
+                        } finally {
+                            if (this._episodePrefetchAbortController === controller) {
+                                this._episodePrefetchAbortController = null;
+                            }
+                        }
+                    }, 8000);
+                },
+
+                videoPreparationProgressPct() {
+                    const progress = Number(this.videoPreparation?.progress || 0);
+                    return Math.max(0, Math.min(100, Math.round(progress * 100)));
+                },
+
+                videoPreparationLabel() {
+                    const status = String(this.videoPreparation?.status || 'idle');
+                    const episodeId = this.pendingEpisodeId ?? this.currentEpisodeId;
+                    if (status === 'error') {
+                        return `Episode ${episodeId}: video preparation failed`;
+                    }
+                    if (status === 'queued') {
+                        return `Episode ${episodeId}: preparing metadata / queued for video preparation`;
+                    }
+                    return `Episode ${episodeId}: loading left / mid / right in parallel`;
+                },
+
+                videoPreparationCameraEntries() {
+                    const cameras = this.videoPreparation?.cameras || {};
+                    return Object.entries(cameras).map(([name, state]) => {
+                        const progress = Math.max(0, Math.min(100, Math.round(Number(state?.progress || 0) * 100)));
+                        let label = `${progress}%`;
+                        if (state?.status === 'ready') {
+                            label = 'ready';
+                        } else if (state?.total_gops) {
+                            label = `${state.completed_gops || 0}/${state.total_gops} GOP`;
+                        } else if (state?.status === 'queued') {
+                            label = 'queued';
+                        }
+                        return { name, label };
+                    });
+                },
+
+                clearEpisodeVideosFromDom() {
+                    Array.from(document.querySelectorAll('[data-video-card] video')).forEach((videoElement) => {
+                        videoElement.pause();
+                        const sourceElement = videoElement.querySelector('source');
+                        if (sourceElement) {
+                            sourceElement.removeAttribute('src');
+                        }
+                        videoElement.removeAttribute('src');
+                        videoElement.load();
+                    });
+                },
+
+                async pollVideoPreparation(statusUrl, episodeId, pollId) {
+                    if (!statusUrl) {
+                        return;
+                    }
+                    while (pollId === this._videoPreparationPollId && Number(episodeId) === this.currentEpisodeId) {
+                        try {
+                            const response = await fetch(statusUrl, {
+                                cache: 'no-store',
+                                headers: { Accept: 'application/json' },
+                            });
+                            if (!response.ok) {
+                                throw new Error(`video status request failed (${response.status})`);
+                            }
+                            const status = await response.json();
+                            if (pollId !== this._videoPreparationPollId || Number(episodeId) !== this.currentEpisodeId) {
+                                return;
+                            }
+                            this.videoPreparation = status;
+                            this.applyReadyEpisodeVideosToDom();
+                            if (status.status === 'ready') {
+                                this.scheduleNextEpisodePrefetch();
+                                return;
+                            }
+                            if (status.status === 'error') {
+                                return;
+                            }
+                        } catch (error) {
+                            console.error('Video preparation polling failed', error);
+                            this.videoPreparation = {
+                                ...(this.videoPreparation || {}),
+                                status: 'error',
+                                error: error?.message || String(error),
+                            };
+                            return;
+                        }
+                        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+                    }
+                },
+
+                async retryVideoPreparation() {
+                    const statusUrl = this.videoPreparation?.status_url;
+                    if (!statusUrl) {
+                        return;
+                    }
+                    const pollId = ++this._videoPreparationPollId;
+                    this.videoPreparation = {
+                        ...(this.videoPreparation || {}),
+                        status: 'queued',
+                        progress: 0,
+                        error: null,
+                    };
+                    try {
+                        const response = await fetch(statusUrl, {
+                            method: 'POST',
+                            cache: 'no-store',
+                            headers: { Accept: 'application/json' },
+                        });
+                        if (!response.ok) {
+                            throw new Error(`video retry failed (${response.status})`);
+                        }
+                        this.videoPreparation = await response.json();
+                        this.pollVideoPreparation(statusUrl, this.currentEpisodeId, pollId);
+                    } catch (error) {
+                        this.videoPreparation = {
+                            ...(this.videoPreparation || {}),
+                            status: 'error',
+                            error: error?.message || String(error),
+                        };
+                    }
+                },
+
                 clearDygraph() {
                     if (this.dygraph && typeof this.dygraph.destroy === 'function') {
                         this.dygraph.destroy();
@@ -2582,6 +2905,31 @@
                             sourceElement.src = videoInfo.url || '';
                             videoElement.load();
                         }
+                    });
+                    return true;
+                },
+
+                applyReadyEpisodeVideosToDom() {
+                    const cards = Array.from(document.querySelectorAll('[data-video-card]'));
+                    if (cards.length !== this.videosInfo.length) {
+                        return false;
+                    }
+                    cards.forEach((card, index) => {
+                        const videoInfo = this.videosInfo[index];
+                        const camera = String(videoInfo?.filename || '').split('.').pop();
+                        const cameraState = this.videoPreparation?.cameras?.[camera];
+                        if (cameraState?.status !== 'ready') {
+                            return;
+                        }
+                        const videoElement = card.querySelector('video');
+                        const sourceElement = videoElement?.querySelector('source');
+                        if (!videoElement || !sourceElement || sourceElement.getAttribute('src') === videoInfo.url) {
+                            return;
+                        }
+                        card.dataset.videoKey = String(videoInfo.filename || '');
+                        videoElement.dataset.videoKey = String(videoInfo.filename || '');
+                        sourceElement.src = videoInfo.url || '';
+                        videoElement.load();
                     });
                     return true;
                 },
@@ -2744,7 +3092,13 @@
                         }
                         const videoKey = this.videoKeyForElement(video) || String(this.videosInfo[index]?.filename || '');
                         const target = this.frameIndexToVideoTime(frameIndex, videoKey, video.duration);
-                        if (Math.abs(video.currentTime - target) > 0.01) {
+                        const seekEntry = this.getVideoSeekEntry(videoKey);
+                        const fps = Number(seekEntry?.fps || 30);
+                        // Normal playback can drift by one or two frames. Seeking for
+                        // every tiny drift stalls secondary decoders, so only correct
+                        // streams when they are visibly out of sync (at least 6 frames).
+                        const resyncThreshold = Math.max(0.2, 6 / Math.max(1, fps));
+                        if (Math.abs(video.currentTime - target) > resyncThreshold) {
                             video.currentTime = target;
                         }
                     });
@@ -2848,7 +3202,9 @@
                     this.resetPlaybackUi();
 
                     this.videos = document.querySelectorAll('video');
-                    this.video = this.videos[0] || null;
+                    this.video = Array.from(this.videos).find((video) => {
+                        return this.videoKeyForElement(video).split('.').pop().toLowerCase() === 'mid';
+                    }) || this.videos[0] || null;
 
                     const csvDataStr = this.episodePayload?.episode_data_csv_str || '';
                     const blob = new Blob([csvDataStr], { type: 'text/csv;charset=utf-8;' });
@@ -2986,17 +3342,43 @@
                     }
 
                     this.isEpisodeLoading = true;
+                    const prefetchedPayload = this.prefetchedEpisodeId === normalizedEpisodeId
+                        ? this.prefetchedEpisodePayload
+                        : null;
+                    this.cancelEpisodePrefetch({ clearPayload: true });
+                    const pollId = ++this._videoPreparationPollId;
+                    this.pendingEpisodeId = normalizedEpisodeId;
+                    this.videoPreparation = {
+                        status: 'queued',
+                        progress: 0,
+                        cameras: {},
+                        error: null,
+                        status_url: null,
+                    };
                     try {
-                        const payload = await this.fetchEpisodePayload(normalizedEpisodeId);
+                        const payload = prefetchedPayload || await this.fetchEpisodePayload(normalizedEpisodeId);
                         this.episodePayload = payload;
+                        this.videoPreparation = payload.video_preparation || {
+                            status: 'ready',
+                            progress: 1.0,
+                            cameras: {},
+                            error: null,
+                            status_url: null,
+                        };
                         const shouldContinue = this.applyEpisodeMetadata(payload);
+                        this.pendingEpisodeId = null;
                         if (!shouldContinue) {
                             return;
                         }
 
-                        if (!this.applyEpisodeVideosToDom()) {
-                            window.location.href = this.episodeHref(normalizedEpisodeId);
-                            return;
+                        if (this.videoPreparation.status === 'ready') {
+                            if (!this.applyEpisodeVideosToDom()) {
+                                window.location.href = this.episodeHref(normalizedEpisodeId);
+                                return;
+                            }
+                        } else {
+                            this.clearEpisodeVideosFromDom();
+                            this.applyReadyEpisodeVideosToDom();
                         }
 
                         if (this.annotationEnabled) {
@@ -3007,6 +3389,15 @@
                         if (pushHistory) {
                             window.history.pushState({ episodeId: normalizedEpisodeId }, '', this.episodeHref(normalizedEpisodeId));
                         }
+                        if (this.videoPreparation.status !== 'ready' && this.videoPreparation.status !== 'error') {
+                            this.pollVideoPreparation(
+                                this.videoPreparation.status_url,
+                                normalizedEpisodeId,
+                                pollId,
+                            );
+                        } else if (this.videoPreparation.status === 'ready') {
+                            this.scheduleNextEpisodePrefetch();
+                        }
                     } catch (error) {
                         console.error('Episode switch failed', error);
                         const fatal = document.getElementById('fatalError');
@@ -3015,7 +3406,11 @@
                             fatal.textContent = `Failed to switch episode: ${error?.message || error}`;
                         }
                     } finally {
+                        this.pendingEpisodeId = null;
                         this.isEpisodeLoading = false;
+                        if (this.videoPreparation?.status === 'ready') {
+                            this.scheduleNextEpisodePrefetch();
+                        }
                     }
                 },
 
@@ -3103,7 +3498,7 @@
                     if (this.autoPlayStarted) {
                         return;
                     }
-                    if (this.nVideoReadyToPlay < this.nVideos) {
+                    if (!this.videoReadyElements?.has(this.video)) {
                         return;
                     }
                     if (!this.dygraphReady) {
@@ -3355,6 +3750,14 @@
                             }
                         };
                         window.addEventListener('popstate', this._onPopState);
+                        window.addEventListener('beforeunload', () => this.cancelEpisodePrefetch({ clearPayload: true }));
+                        document.addEventListener('visibilitychange', () => {
+                            if (document.visibilityState === 'visible') {
+                                this.scheduleNextEpisodePrefetch();
+                            } else {
+                                this.cancelEpisodePrefetch();
+                            }
+                        });
 
                         window.__datasetVisualizerApp = this;
 
@@ -3388,11 +3791,26 @@
                             this.frameEvents = [];
                         }
 
-                        if (!this.applyEpisodeVideosToDom()) {
-                            throw new Error('Current template video cards do not match episode payload.');
+                        if (this.videoPreparation.status === 'ready') {
+                            if (!this.applyEpisodeVideosToDom()) {
+                                throw new Error('Current template video cards do not match episode payload.');
+                            }
+                        } else {
+                            this.clearEpisodeVideosFromDom();
+                            this.applyReadyEpisodeVideosToDom();
                         }
 
                         await this.buildDygraphFromCurrentEpisode(true);
+                        if (this.videoPreparation.status !== 'ready' && this.videoPreparation.status !== 'error') {
+                            const pollId = ++this._videoPreparationPollId;
+                            this.pollVideoPreparation(
+                                this.videoPreparation.status_url,
+                                this.currentEpisodeId,
+                                pollId,
+                            );
+                        } else if (this.videoPreparation.status === 'ready') {
+                            this.scheduleNextEpisodePrefetch();
+                        }
                     } catch (error) {
                         console.error('Visualizer init failed', error);
                         const fatal = document.getElementById('fatalError');
@@ -3526,6 +3944,19 @@
                     }
                     this.videoReadyElements.add(videoElement);
                     this.nVideoReadyToPlay += 1;
+                    if (this.playbackActive && videoElement !== this.video) {
+                        const frameIndex = this.videoTimeToFrameIndex(
+                            this.video?.currentTime || 0,
+                            this.videoKeyForElement(this.video),
+                        );
+                        videoElement.currentTime = this.frameIndexToVideoTime(
+                            frameIndex,
+                            this.videoKeyForElement(videoElement),
+                            videoElement.duration,
+                        );
+                        videoElement.playbackRate = parseFloat(this.$refs.playbackSpeed?.value) || 1.0;
+                        videoElement.play().catch(() => {});
+                    }
                     this.tryAutoPlayWhenReady();
                 }
             };
